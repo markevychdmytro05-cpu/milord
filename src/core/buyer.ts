@@ -208,7 +208,14 @@ export async function runTask(
           watchUntil ||= lastClickAt + WATCH_AFTER_CLICK_MS;
           await update('firing', `Спроба додати в кошик: ${task.clicks}/${MAX_CLICKS}.`);
           check();
-          await session.clickBuy();
+          try { await session.clickBuy(); }
+          catch (error) {
+            if (!(error instanceof ShopRateLimitError)) throw error;
+            // The provider checks the shared guard before dispatching the click.
+            task.clicks--;
+            if (!task.clicks) watchUntil = 0;
+            await update('waiting', 'НБУ відповів 429 перед натисканням. Очікуємо автоматичну повторну спробу.');
+          }
         }
       } else if (!task.clicks && clock.now() >= nextReloadAt) {
         task.reloads++;
@@ -226,7 +233,9 @@ export async function runTask(
     task.status = signal.aborted ? 'cancelled' : task.clicks || observedPurchase ? 'interrupted'
       : error instanceof ShopRateLimitError ? 'expired' : 'failed';
     // Provider errors are deliberately not persisted: they can contain a CDP URL or a token.
-    task.note = error instanceof ShopRateLimitError ? error.message : signal.aborted
+    task.note = error instanceof ShopRateLimitError
+      ? error.message + (task.clicks || observedPurchase ? ' Результат додавання невідомий — перевірте кошик.' : '')
+      : signal.aborted
       ? 'Зупинено. Уже надіслану дію не скасовано; перевірте кошик, якщо було натискання.'
       : task.clicks || observedPurchase
         ? 'Зв’язок або дія завершилися помилкою. Перевірте кошик перед новою спробою.'

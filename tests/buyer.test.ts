@@ -360,3 +360,18 @@ it.each([false, true])('never repeats an uncertain purchase after a 429 refresh 
   expect(input.status).toBe(confirmed ? 'in_cart' : 'interrupted');
   expect(browser.clicks).toHaveLength(1);
 });
+
+it('recovers when another tab reports 429 between persisted intent and the actual click', async () => {
+  const { ShopRateLimitError } = await import('../src/core/shop-errors');
+  const clock = new FakeClock(); let limited = false; let refused = false;
+  const browser = fakeBrowser(clock, () => ({ ...ready, rateLimited: limited, inCart: browser.clicks.length > 0 }));
+  const click = browser.session.clickBuy;
+  browser.session.clickBuy = async () => {
+    if (!refused) { refused = true; limited = true; throw new ShopRateLimitError(); }
+    await click();
+  };
+  browser.session.recoverRateLimit = async () => { clock.time += 30_000; limited = false; return true; };
+  const input = task();
+  await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+  expect(input.status).toBe('in_cart'); expect(input.clicks).toBe(1); expect(browser.clicks).toHaveLength(1);
+});

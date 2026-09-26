@@ -204,7 +204,7 @@ export class AdsPowerProvider implements BrowserProvider {
       for (const page of shopPages) {
         await ensurePrepared(page);
         const state = await readState(page);
-        if (state.purchasePending && (targets.length > 1 || page.url() !== targets[0])) {
+        if ((state.purchasePending || state.queuePosition) && (targets.length > 1 || page.url() !== targets[0])) {
           throw new Error('An existing purchase must finish before preparing other products');
         }
       }
