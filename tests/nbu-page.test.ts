@@ -119,3 +119,17 @@ it.each(['<h1>429 Помилка</h1>', '<title>Помилка 429 - Націо�
   expect(readNbuPage().rateLimited).toBe(true);
   expect(() => readNbuPage(true)).toThrow('Page state changed');
 });
+
+it('confirms exact product IDs and quantities in the visible, unexpired cart only', async () => {
+  const { readVisibleCartProductIds } = await import('../src/browser/nbu-page');
+  const row = (id: string, quantity: string, timer: string) => `<div class="cartContent_body">
+    <input name="products_id[]" value="${id}"><select name="cart_quantity[]"><option>${quantity}</option></select>
+    <div class="cart-item-timer"><div class="timer-numbers">${timer}</div></div></div>`;
+  const document = page(`<div id="modal_cart_popup">${row('1126', '1', '29 : 30')}${row('885', '1', '00:15')}
+    ${row('123', '0', '28:00')}${row('456', '1', '00:00')}${row('789', '1', '')}</div>`);
+  const popup = document.querySelector('#modal_cart_popup')!;
+  const rects = vi.spyOn(popup, 'getClientRects').mockReturnValue([{ width: 500, height: 300 }] as unknown as DOMRectList);
+  expect(readVisibleCartProductIds()).toEqual(['1126', '885']);
+  rects.mockReturnValue([] as unknown as DOMRectList);
+  expect(readVisibleCartProductIds()).toEqual([]);
+});

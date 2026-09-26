@@ -1,7 +1,7 @@
 // Adapted from nbu-store-speed-buyer content.js (MIT).
 // Copyright (c) 2026 Mykhailo Toporkov. See third-party/nbu-store-speed-buyer/LICENSE.
 import { isFinal, type Task, type TaskStatus } from './model';
-import { ShopRateLimitError } from './shop-errors';
+import { ShopRateLimitError, UserFacingError } from './shop-errors';
 import type { BrowserProvider, Clock, PageState, ShopSession } from './ports';
 
 export const CLICK_COOLDOWN_MS = 11_000;
@@ -237,6 +237,8 @@ export async function runTask(
       ? error.message + (task.clicks || observedPurchase ? ' Результат додавання невідомий — перевірте кошик.' : '')
       : signal.aborted
       ? 'Зупинено. Уже надіслану дію не скасовано; перевірте кошик, якщо було натискання.'
+      : error instanceof UserFacingError
+      ? error.message + (task.clicks || observedPurchase ? ' Перевірте кошик перед новою спробою.' : '')
       : task.clicks || observedPurchase
         ? 'Зв’язок або дія завершилися помилкою. Перевірте кошик перед новою спробою.'
         : 'Не вдалося виконати завдання. Перевірте AdsPower, профіль і сторінку магазину.';

@@ -130,6 +130,11 @@ async function boot(): Promise<void> {
   handle('add-task', (input) => scheduler.add(taskInputSchema.parse(input)));
   handle('add-tasks', (input) => scheduler.addMany(z.array(taskInputSchema).min(1).max(200).parse(input)));
   handle('cancel-task', (input) => scheduler.cancel(z.string().uuid().parse(input)));
+  handle('update-task', (input) => {
+    const parsed = z.object({ id: z.string().uuid(), url: z.string().max(2048),
+      saleAt: z.number().int().positive().max(8_640_000_000_000_000) }).parse(input);
+    return scheduler.update(parsed.id, parsed);
+  });
   handle('inspect-profile', (input) => {
     const parsed = z.object({
       profileId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),

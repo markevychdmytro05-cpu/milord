@@ -3,6 +3,11 @@ import { AdsPowerClient, validateCdpEndpoint } from '../src/browser/adspower';
 import { productUrl, taskInputSchema } from '../src/core/model';
 import { task } from './helpers';
 
+const failureOf = async (attempt: Promise<unknown>): Promise<Error> => {
+  try { await attempt; } catch (error) { return error as Error; }
+  throw new Error('expected the call to fail');
+};
+
 describe('AdsPower Local API adapter', () => {
   it('starts the selected profile and uses its CDP endpoint', async () => {
     const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
@@ -24,9 +29,42 @@ describe('AdsPower Local API adapter', () => {
   });
 
   it('does not surface a raw AdsPower error body', async () => {
-    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ code: -1, msg: 'private-token' })));
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ code: -1, msg: 'private-secret' })));
     const client = new AdsPowerClient('http://localhost:50325', '', request);
-    await expect(client.start('abc', new AbortController().signal)).rejects.toThrow('could not start');
+    const failure = await failureOf(client.start('abc', new AbortController().signal));
+    expect(failure.message).toContain('не зміг запустити профіль (код -1)');
+    expect(failure.message).not.toContain('private-secret');
+  });
+
+  it.each([
+    [{ code: -1, msg: 'user_id is not exist' }, 'не знайшов цей профіль'],
+    [{ code: -1, msg: 'Too many request per second' }, 'обмежив частоту'],
+    [{ code: -1, msg: 'Invalid API key' }, 'API-ключ'],
+  ])('explains a known AdsPower failure without echoing its text: %j', async (body, expected) => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(body)));
+    const failure = await failureOf(new AdsPowerClient('http://localhost:50325', '', request).start('abc', new AbortController().signal));
+    expect(failure.message).toContain(expected);
+    expect(failure.message).not.toContain(body.msg);
+    expect(failure.name).toBe('UserFacingError');
+  });
+
+  it('says AdsPower is unreachable, wrong-key or failing, using fixed text', async () => {
+    const down = vi.fn<typeof fetch>().mockRejectedValue(new TypeError('fetch failed ECONNREFUSED 127.0.0.1:50325'));
+    const unreachable = await failureOf(new AdsPowerClient('http://localhost:50325', '', down).start('abc', new AbortController().signal));
+    expect(unreachable.message).toContain('зв’язатися з AdsPower');
+    expect(unreachable.message).not.toContain('50325');
+    const denied = vi.fn<typeof fetch>().mockResolvedValue(new Response('key=abc', { status: 401 }));
+    expect((await failureOf(new AdsPowerClient('http://localhost:50325', 'abc', denied).start('abc', new AbortController().signal))).message).toContain('API-ключ');
+    const broken = vi.fn<typeof fetch>().mockResolvedValue(new Response('boom', { status: 500 }));
+    expect((await failureOf(new AdsPowerClient('http://localhost:50325', '', broken).start('abc', new AbortController().signal))).message).toContain('HTTP 500');
+  });
+
+  it('does not report a cancelled start as an AdsPower problem', async () => {
+    const cancelled = new AbortController(); cancelled.abort();
+    const request = vi.fn<typeof fetch>().mockRejectedValue(new DOMException('aborted', 'AbortError'));
+    await expect(new AdsPowerClient('http://localhost:50325', '', request).start('abc', cancelled.signal)).rejects.toThrow();
+    const failure = await failureOf(new AdsPowerClient('http://localhost:50325', '', request).start('abc', cancelled.signal));
+    expect(failure.name).not.toBe('UserFacingError');
   });
 });
 

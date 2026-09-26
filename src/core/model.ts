@@ -97,5 +97,6 @@ export interface DesktopApi {
   addTask(input: TaskInput): Promise<void>;
   addTasks(input: TaskInput[]): Promise<void>;
   cancelTask(id: string): Promise<void>;
+  updateTask(input: { id: string; url: string; saleAt: number }): Promise<void>;
   inspectProfile(input: { profileId: string; url: string }): Promise<string>;
 }

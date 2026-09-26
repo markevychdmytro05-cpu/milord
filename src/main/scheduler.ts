@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { runTask } from '../core/buyer';
-import { isFinal, taskInputSchema, type Task, type TaskInput } from '../core/model';
+import { isFinal, productUrl, taskInputSchema, type Task, type TaskInput } from '../core/model';
 import { realClock, type BrowserProvider, type PreparedProfile } from '../core/ports';
+import { UserFacingError } from '../core/shop-errors';
 import { Store } from './store';
 
 export function tasksOverlap(a: TaskInput, b: TaskInput): boolean {
@@ -11,8 +12,8 @@ export function tasksOverlap(a: TaskInput, b: TaskInput): boolean {
 }
 
 export class Scheduler {
-  private running = new Map<string, { controller: AbortController; done: Promise<void>; profileId: string }>();
-  private prepared = new Map<string, PreparedProfile>();
+  private running = new Map<string, { controller: AbortController; done: Promise<void>; profileId: string; batchId?: string }>();
+  private prepared = new Map<string, { controller: AbortController; promise: Promise<PreparedProfile> }>();
   private inspecting = new Set<string>();
   private timer?: ReturnType<typeof setInterval>;
   private mutations: Promise<unknown> = Promise.resolve();
@@ -63,12 +64,52 @@ export class Scheduler {
         positions.set(input.profileId, batchIndex + 1);
         return {
           ...input, id: randomUUID(), batchId, batchIndex, status: 'scheduled', createdAt: Date.now(), updatedAt: Date.now(),
-          clicks: 0, reloads: 0, offsetMs: 0, note: batchIndex > 0
-            ? 'Очікує попередню монету цього профілю.' : 'Завдання заплановано.', events: [],
+          clicks: 0, reloads: 0, offsetMs: 0, note: 'Завдання заплановано. Монети запускаються незалежно.', events: [],
         };
       });
       await this.store.addTasks(tasks);
       for (const task of tasks) this.onTask(task);
+      this.tick();
+    });
+  }
+
+  // Change the coin link of one waiting task, or the start time of the whole batch it was created with.
+  // A batch shares one preparation and one start time, so its members move together.
+  update(id: string, patch: { url: string; saleAt: number }): Promise<void> {
+    return this.serialize(async () => {
+      const all = this.store.tasks();
+      const task = all.find((item) => item.id === id);
+      if (!task) throw new Error('Завдання не знайдено.');
+      const group = task.batchId ? all.filter((item) => item.batchId === task.batchId) : [task];
+      const started = task.status !== 'scheduled' || this.running.has(id) ||
+        group.some((item) => !isFinal(item.status) && item.status !== 'scheduled') ||
+        (!!task.batchId && [...this.prepared.keys()].some((key) => key.startsWith(JSON.stringify([task.batchId]).slice(0, -1))));
+      if (started) throw new Error('Завдання вже виконується. Зупиніть його й створіть нове.');
+      const url = productUrl(patch.url.trim());
+      const timeChanged = patch.saleAt !== task.saleAt;
+      if (url === task.url && !timeChanged) return;
+      if (!Number.isSafeInteger(patch.saleAt) || patch.saleAt <= Date.now()) throw new Error('Оберіть час у майбутньому.');
+      if (url !== task.url && group.some((item) => item.id !== id && !isFinal(item.status) &&
+        item.profileId === task.profileId && item.url === url)) {
+        throw new Error('Ця монета вже є для цього профілю в тій самій партії.');
+      }
+      const targets = timeChanged ? group.filter((item) => item.status === 'scheduled') : [task];
+      const others = all.filter((item) => !isFinal(item.status) && !group.some((member) => member.id === item.id));
+      for (const target of targets) {
+        if (this.inspecting.has(target.profileId) || others.some((item) => tasksOverlap(item, { ...target, saleAt: patch.saleAt }))) {
+          throw new Error(`Профіль ${target.profileId} уже зайнятий у цей проміжок часу. Нічого не змінено.`);
+        }
+      }
+      const now = Date.now();
+      const changed = targets.map((item): Task => ({
+        ...item, updatedAt: now,
+        url: item.id === id ? url : item.url,
+        saleAt: timeChanged ? patch.saleAt : item.saleAt,
+        events: [...item.events, { at: now, message: item.id === id && url !== item.url
+          ? (timeChanged ? 'Змінено монету й час старту.' : 'Змінено монету.') : 'Змінено час старту.' }].slice(-200),
+      }));
+      await this.store.saveTasks(changed);
+      for (const item of changed) this.onTask(item);
       this.tick();
     });
   }
@@ -106,7 +147,9 @@ export class Scheduler {
       if (state.challenge || state.turnstile) return 'Профіль відкрито. Завершіть перевірку сайту у браузері.';
       if (state.login !== 'logged-in') return 'Профіль відкрито. Увійдіть в акаунт НБУ у браузері.';
       return state.inCart ? 'Підключення працює. Товар уже в кошику.' : 'Підключення працює. Вхід в акаунт підтверджено.';
-    } catch {
+    } catch (error) {
+      // Rethrown as a plain Error so the IPC layer does not prefix the class name.
+      if (error instanceof UserFacingError) throw new Error(error.message);
       throw new Error('Не вдалося перевірити профіль. Перевірте API, ключ, ID профілю та закрийте зайві вкладки НБУ.');
     } finally {
       await session?.disconnect().catch(() => {});
@@ -118,9 +161,10 @@ export class Scheduler {
   async stop(): Promise<void> {
     this.stopped = true;
     clearInterval(this.timer);
+    for (const entry of this.prepared.values()) entry.controller.abort();
     for (const active of this.running.values()) active.controller.abort();
     await Promise.all([...this.running.values()].map((active) => active.done));
-    await Promise.all([...this.prepared.values()].map((pool) => pool.disconnect().catch(() => {})));
+    await Promise.all([...this.prepared.values()].map((entry) => entry.promise.then((pool) => pool.disconnect()).catch(() => {})));
     this.prepared.clear();
   }
 
@@ -129,42 +173,32 @@ export class Scheduler {
     for (const task of this.store.tasks()) {
       if (task.status !== 'scheduled' || this.running.has(task.id) || this.inspecting.has(task.profileId) ||
           Date.now() < task.saleAt - task.leadMin * 60_000 ||
-          [...this.running.values()].some((active) => active.profileId === task.profileId)) continue;
-      const previous = task.batchId ? this.store.tasks().filter((item) => item.batchId === task.batchId &&
-        item.profileId === task.profileId && (item.batchIndex ?? 0) < (task.batchIndex ?? 0)) : [];
-      if (previous.some((item) => !isFinal(item.status))) continue;
+          [...this.running.values()].some((active) => active.profileId === task.profileId &&
+            (!task.batchId || active.batchId !== task.batchId))) continue;
       const controller = new AbortController();
       const done = Promise.resolve().then(async () => {
-        if (previous.some((item) => ['interrupted', 'failed', 'cancelled'].includes(item.status))) {
-          task.status = 'cancelled';
-          task.note = 'Послідовність зупинено після збою або скасування попередньої монети. Перевірте профіль і кошик.';
-          task.updatedAt = Date.now();
-          task.events.push({ at: task.updatedAt, message: task.note });
-          await this.store.saveTask(task);
-          this.onTask(task);
-          return;
-        }
         const provider = this.provider();
         const pooled: BrowserProvider = {
           connect: async (profileId, url, signal, options) => {
             if (!task.batchId || !provider.prepare) return provider.connect(profileId, url, signal, options);
             const key = JSON.stringify([task.batchId, profileId]);
-            let pool = this.prepared.get(key);
-            if (!pool) {
+            let entry = this.prepared.get(key);
+            if (!entry) {
               const remaining = this.store.tasks().filter((item) => item.batchId === task.batchId &&
                 item.profileId === profileId && !isFinal(item.status))
                 .sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0));
-              pool = await provider.prepare(profileId, remaining.map((item) => item.url), signal, options);
-              this.prepared.set(key, pool);
-              for (const item of remaining) {
-                const current = this.store.tasks().find((saved) => saved.id === item.id);
-                if (!current || current.id === task.id || current.status !== 'scheduled') continue;
-                current.note = 'Сторінку відкрито заздалегідь. Очікує попередню монету цього профілю.';
-                current.updatedAt = Date.now();
-                await this.store.saveTask(current);
-                this.onTask(current);
-              }
+              // Preparation belongs to the group, not its first task. Cancelling one coin must
+              // not cancel another coin's navigation or disconnect its browser session.
+              const preparationController = new AbortController();
+              const promise = Promise.resolve().then(() => provider.prepare!(profileId,
+                remaining.map((item) => item.url), preparationController.signal, {
+                  deadline: Math.max(...remaining.map((item) => item.saleAt + item.windowMin * 60_000)),
+                }));
+              entry = { controller: preparationController, promise };
+              this.prepared.set(key, entry);
             }
+            const pool = await this.waitForPool(entry.promise, signal);
+            signal.throwIfAborted();
             return pool.connect(profileId, url, signal, options);
           },
         };
@@ -179,20 +213,34 @@ export class Scheduler {
         for (const active of this.running.values()) active.controller.abort();
         this.onError('Помилка збереження завдань. Планувальник зупинено; перезапустіть програму після перевірки диска.');
       }).finally(async () => {
-        if (task.batchId && this.store.tasks().filter((item) => item.batchId === task.batchId &&
-            item.profileId === task.profileId).every((item) => isFinal(item.status))) {
-          const key = JSON.stringify([task.batchId, task.profileId]);
-          const pool = this.prepared.get(key);
-          this.prepared.delete(key);
-          await pool?.disconnect().catch(() => {});
-        }
         this.running.delete(task.id);
+        if (task.batchId &&
+            ![...this.running.values()].some((active) => active.batchId === task.batchId && active.profileId === task.profileId) &&
+            this.store.tasks().filter((item) => item.batchId === task.batchId &&
+              item.profileId === task.profileId).every((item) => isFinal(item.status))) {
+          const key = JSON.stringify([task.batchId, task.profileId]);
+          const entry = this.prepared.get(key);
+          this.prepared.delete(key);
+          entry?.controller.abort();
+          await entry?.promise.then((pool) => pool.disconnect()).catch(() => {});
+        }
         this.onBusy(this.hasActiveWork());
         if (!this.stopped) this.tick();
       });
-      this.running.set(task.id, { controller, done, profileId: task.profileId });
+      this.running.set(task.id, { controller, done, profileId: task.profileId, batchId: task.batchId });
     }
     this.onBusy(this.hasActiveWork());
+  }
+
+  private async waitForPool(promise: Promise<PreparedProfile>, signal: AbortSignal): Promise<PreparedProfile> {
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(new Error('Task cancelled during preparation'));
+      signal.addEventListener('abort', abort, { once: true });
+    });
+    try { return await Promise.race([promise, cancelled]); }
+    finally { signal.removeEventListener('abort', abort); }
   }
 
   private serialize<T>(action: () => Promise<T>): Promise<T> {

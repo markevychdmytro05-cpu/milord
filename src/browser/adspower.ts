@@ -3,8 +3,8 @@ import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
 import type { BrowserProvider, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
-import { ShopRequestGuard } from '../core/shop-errors';
-import { assertShopPage, readNbuPage, waitForActionablePage } from './nbu-page';
+import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
+import { assertShopPage, readNbuPage, readVisibleCartProductIds, waitForActionablePage } from './nbu-page';
 
 const startResponse = z.object({
   code: z.literal(0),
@@ -35,6 +35,21 @@ export class ProfileStartGate {
     this.tail = turn.catch(() => {});
     return turn;
   }
+}
+
+// Translate AdsPower's own error text into fixed messages. The raw text is never shown or saved.
+export function adsPowerFailure(code: number | undefined, message: string | undefined): UserFacingError {
+  const text = (message || '').toLowerCase();
+  if (/not.?exist|not.?found|no such|invalid.?user|user.?id/.test(text)) {
+    return new UserFacingError('AdsPower не знайшов цей профіль. Перевірте ID профілю.');
+  }
+  if (/too many|frequen|rate/.test(text)) {
+    return new UserFacingError('AdsPower обмежив частоту запитів. Спробуйте за кілька секунд.');
+  }
+  if (/api.?key|auth|token|permission|unauthori|forbidden/.test(text)) {
+    return new UserFacingError('AdsPower відхилив запит. Перевірте API-ключ у налаштуваннях.');
+  }
+  return new UserFacingError(`AdsPower не зміг запустити профіль${Number.isInteger(code) ? ` (код ${code})` : ''}.`);
 }
 
 export class AdsPowerClient {
@@ -78,15 +93,33 @@ export class AdsPowerClient {
     // Do not restore unrelated historical tabs or open the IP test page.
     url.searchParams.set('open_tabs', '1');
     url.searchParams.set('ip_tab', '0');
-    const response = await this.request(url, {
-      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
-      signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-      redirect: 'error',
-    });
-    if (!response.ok) throw new Error('AdsPower Local API request failed');
-    const result = startResponse.safeParse(await response.json());
-    if (!result.success) throw new Error('AdsPower could not start the selected profile');
-    return validateCdpEndpoint(result.data.data.ws.puppeteer);
+    let response: Awaited<ReturnType<typeof fetch>>; // not Playwright's Response, which is imported here
+    try {
+      response = await this.request(url, {
+        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+        signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
+        redirect: 'error',
+      });
+    } catch (error) {
+      if (signal.aborted) throw error;
+      throw new UserFacingError(error instanceof Error && error.name === 'TimeoutError'
+        ? 'AdsPower не відповів за 60 секунд. Перевірте, чи запускається профіль вручну.'
+        : 'Не вдалося зв’язатися з AdsPower. Запустіть AdsPower і перевірте, що Local API увімкнено.');
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new UserFacingError('AdsPower відхилив запит. Перевірте API-ключ у налаштуваннях.');
+    }
+    if (!response.ok) throw new UserFacingError(`AdsPower Local API відповів помилкою (HTTP ${response.status}).`);
+    let body: unknown;
+    try { body = await response.json(); }
+    catch { throw new UserFacingError('AdsPower відповів у незрозумілому форматі. Оновіть AdsPower.'); }
+    const result = startResponse.safeParse(body);
+    if (!result.success) {
+      const failure = z.object({ code: z.number().optional(), msg: z.string().optional() }).safeParse(body);
+      throw adsPowerFailure(failure.data?.code, failure.data?.msg);
+    }
+    try { return validateCdpEndpoint(result.data.data.ws.puppeteer); }
+    catch { throw new UserFacingError('AdsPower повернув некоректну адресу браузера профілю.'); }
   }
 }
 
@@ -142,7 +175,19 @@ export class AdsPowerProvider implements BrowserProvider {
     const readState = async (page: Page) => {
       const state = await page.evaluate(readNbuPage, false);
       if (state.rateLimited && !this.guard.isBlocked()) this.guard.block();
-      return { ...state, rateLimited: state.rateLimited || this.guard.isBlocked() };
+      // Parallel store submissions may be finalized together, while only one tab updates
+      // its button. The visible cart in another prepared tab can confirm this exact product.
+      if (!state.inCart && state.login === 'logged-in' && pages.size) {
+        const url = new URL(page.url());
+        const id = url.pathname.match(/\/p-(\d+)\.html$/)?.[1] ?? url.searchParams.get('products_id');
+        if (id && /^\d+$/.test(id)) {
+          const carts = await Promise.all([...pages.values()].filter((candidate) => !candidate.isClosed() &&
+            new URL(candidate.url()).origin === url.origin)
+            .map((candidate) => candidate.evaluate(readVisibleCartProductIds).catch((): string[] => [])));
+          state.inCart = carts.some((ids) => ids.includes(id));
+        }
+      }
+      return { ...state, rateLimited: !state.inCart && (state.rateLimited || this.guard.isBlocked()) };
     };
     const observeResponse = (page: Page, response: Response) => {
       if (seenResponses.has(response)) return;
@@ -182,39 +227,52 @@ export class AdsPowerProvider implements BrowserProvider {
       }
     };
     try {
-      browser = await chromium.connectOverCDP(endpoint, { timeout: 20_000 });
+      try { browser = await chromium.connectOverCDP(endpoint, { timeout: 20_000 }); }
+      catch (error) {
+        if (signal.aborted) throw error;
+        throw new UserFacingError('Не вдалося підключитися до браузера профілю. Закрийте профіль в AdsPower і спробуйте знову.');
+      }
       signal.throwIfAborted();
       const context = browser.contexts()[0];
-      if (!context) throw new Error('AdsPower browser context is missing');
+      if (!context) throw new UserFacingError('У профілі AdsPower немає відкритого вікна браузера.');
       const shopPages = context.pages().filter((page) => {
         try { return new URL(page.url()).origin === 'https://coins.bank.gov.ua'; } catch { return false; }
       });
-      // Adopt only requested product tabs. A single old store tab can be reused.
-      // Never close or rewrite an unrelated set of the user's store tabs.
-      if (shopPages.length > 1 && shopPages.some((page) => !targets.includes(page.url()))) {
-        throw new Error('Close unrelated NBU store tabs before preparing this sequence');
-      }
+      // Only tabs that already show a requested product are adopted. Every other store tab, for example
+      // one left after an earlier purchase, is left exactly as it is: not closed, navigated, reloaded or
+      // reused. The bot opens its own tab instead, so a finished purchase never blocks the next one.
+      const ours = shopPages.filter((page) => targets.includes(page.url()));
+      const foreign = shopPages.filter((page) => !targets.includes(page.url()));
       const observe = (page: Page) => {
         if (listeners.some((listener) => listener.page === page)) return;
         const handler = (response: Response) => observeResponse(page, response);
         page.on('response', handler);
         listeners.push({ page, handler });
       };
-      for (const page of shopPages) observe(page);
-      for (const page of shopPages) {
+      for (const page of ours) {
+        observe(page);
+        pages.set(page.url(), page);
+      }
+      // A purchase still in flight in another store tab must finish first. This only reads the page:
+      // it neither reloads it nor counts its 429 page against our own shared cooldown.
+      for (const page of foreign) {
+        const other = await page.evaluate(readNbuPage, false).catch(() => undefined);
+        if (other && !other.inCart && (other.purchasePending || other.queuePosition)) {
+          throw new UserFacingError('В іншій вкладці НБУ ще триває покупка. Дочекайтеся її завершення.');
+        }
+      }
+      for (const page of ours) {
         await ensurePrepared(page);
         const state = await readState(page);
-        if ((state.purchasePending || state.queuePosition) && (targets.length > 1 || page.url() !== targets[0])) {
-          throw new Error('An existing purchase must finish before preparing other products');
+        if (!state.inCart && (state.purchasePending || state.queuePosition) && (targets.length > 1 || page.url() !== targets[0])) {
+          throw new UserFacingError('У профілі вже триває покупка іншої монети. Дочекайтеся її завершення.');
         }
       }
       const used = new Set<Page>();
       for (const target of targets) {
         signal.throwIfAborted();
-        const matching = shopPages.find((page) => page.url() === target && !used.has(page));
-        const reusable = shopPages.length === 1 && !used.has(shopPages[0]!) &&
-          !targets.includes(shopPages[0]!.url()) ? shopPages[0] : undefined;
-        const page = matching ?? reusable ?? await context.newPage();
+        const matching = ours.find((page) => page.url() === target && !used.has(page));
+        const page = matching ?? await context.newPage();
         used.add(page);
         page.setDefaultTimeout(5000);
         page.setDefaultNavigationTimeout(20_000);
@@ -241,7 +299,7 @@ export class AdsPowerProvider implements BrowserProvider {
           if (disconnected || requestedProfile !== profileId) throw new Error('Prepared profile is unavailable');
           const target = productUrl(url);
           const page = pages.get(target);
-          if (!page || page.isClosed()) throw new Error('Prepared product tab was closed');
+          if (!page || page.isClosed()) throw new UserFacingError('Вкладку монети закрито. Не закривайте її до кінця завдання.');
           const check = () => { taskSignal.throwIfAborted(); };
           check();
           await page.bringToFront();

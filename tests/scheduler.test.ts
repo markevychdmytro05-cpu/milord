@@ -46,15 +46,14 @@ it('rejects the whole batch on a conflict or duplicate profile and persists vali
   await scheduler.stop();
 });
 
-it('processes coins in order within a profile while another profile progresses independently', async () => {
+it('starts another coin in the same profile before the first coin finishes', async () => {
   const store = new Store(join(await mkdtemp(join(tmpdir(), 'nbu-sequence-')), 'tasks.json'));
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const active = new Map<string, number>();
   const calls: string[] = [];
   const provider = { connect: vi.fn(async (profileId: string, url: string) => {
-    expect(active.get(profileId) ?? 0).toBe(0);
-    active.set(profileId, 1); calls.push(`${profileId}:${url.split('/').pop()}`);
+    active.set(profileId, (active.get(profileId) ?? 0) + 1); calls.push(`${profileId}:${url.split('/').pop()}`);
     const state = { login: 'logged-in' as const, challenge: false, rateLimited: false, turnstile: false, purchasePending: false,
       buyAvailable: false, inCart: true, queuePosition: '' };
     return {
@@ -70,28 +69,29 @@ it('processes coins in order within a profile while another profile progresses i
     await scheduler.addMany(['a', 'b'].flatMap((profileId) => ['one', 'two'].map((coin) =>
       task({ profileId, saleAt, url: `https://coins.bank.gov.ua/${coin}.html` }))));
     await vi.waitFor(() => expect(calls).toContain('b:two.html'));
-    expect(calls).not.toContain('a:two.html');
+    expect(calls).toContain('a:two.html');
+    expect(store.tasks().find((t) => t.profileId === 'a' && t.url.endsWith('one.html'))?.status).toBe('preparing');
     release();
     await vi.waitFor(() => expect(store.tasks().every((task) => task.status === 'in_cart')).toBe(true));
     expect(calls.filter((call) => call.startsWith('a:'))).toEqual(['a:one.html', 'a:two.html']);
   } finally { release(); await scheduler.stop(); }
 });
 
-it('stops remaining coins after a profile failure and preserves the batch on disk', async () => {
+it('keeps each coin failure independent and preserves the batch on disk', async () => {
   const { scheduler, store, provider, path } = await setup();
   provider.connect.mockRejectedValue(Error('Browser disconnected'));
   try {
     await scheduler.addMany(['one', 'two'].map((coin) => task({ saleAt: Date.now() + 60_000,
       url: `https://coins.bank.gov.ua/${coin}.html` })));
-    await vi.waitFor(() => expect(store.tasks().map((task) => task.status)).toEqual(['failed', 'cancelled']));
-    expect(provider.connect).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(store.tasks().map((task) => task.status)).toEqual(['failed', 'failed']));
+    expect(provider.connect).toHaveBeenCalledTimes(2);
     const reopened = new Store(path); await reopened.load();
     expect(reopened.tasks()[0]?.batchId).toBe(reopened.tasks()[1]?.batchId);
     expect(reopened.tasks().map((task) => task.batchIndex)).toEqual([0, 1]);
   } finally { await scheduler.stop(); }
 });
 
-it('does not continue a sequence after restart when the preceding purchase was interrupted', async () => {
+it('does not replay an interrupted purchase but starts another scheduled coin after restart', async () => {
   const { scheduler, store, provider, path } = await setup();
   const batchId = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
   await store.saveTask(task({ status: 'firing', clicks: 1, batchId, batchIndex: 0 }));
@@ -100,8 +100,9 @@ it('does not continue a sequence after restart when the preceding purchase was i
   await store.load();
   try {
     scheduler.start();
-    await vi.waitFor(() => expect(store.tasks()[1]?.status).toBe('cancelled'));
-    expect(provider.connect).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledTimes(1));
+    expect(store.tasks()[0]?.status).toBe('interrupted');
+    expect(provider.connect.mock.calls[0]?.[1]).toContain('two.html');
   } finally { await scheduler.stop(); }
 });
 
@@ -127,5 +128,56 @@ it('prepares all batch URLs before the first coin and reuses one pool through co
     expect(store.tasks().map((task) => task.status)).toEqual(['in_cart', 'in_cart']);
     expect(order).toEqual(['prepared', 'https://coins.bank.gov.ua/one.html', 'https://coins.bank.gov.ua/two.html']);
     expect(provider.prepare).toHaveBeenCalledTimes(1); expect(provider.connect).not.toHaveBeenCalled();
+  } finally { await scheduler.stop(); }
+});
+
+it('shares pending preparation and cancelling one coin keeps the other connected', async () => {
+  const store = new Store(join(await mkdtemp(join(tmpdir(), 'nbu-parallel-')), 'tasks.json'));
+  const { ready } = await import('./helpers');
+  let release!: () => void;
+  let preparationSignal!: AbortSignal;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const disconnect = vi.fn(async () => {});
+  const pool = { disconnect, connect: vi.fn(async () => ({
+    read: async () => ({ ...ready, inCart: true }), waitForActionable: async () => ready,
+    reload: async () => {}, serverOffset: async () => 0, clickBuy: async () => {}, disconnect: async () => {},
+  })) };
+  const provider = { connect: vi.fn(), prepare: vi.fn(async (_profile: string, _urls: string[], signal: AbortSignal) => {
+    preparationSignal = signal; await gate; return pool;
+  }) };
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
+  try {
+    await scheduler.addMany(['one', 'two'].map((coin) => task({ saleAt: Date.now() + 60_000,
+      url: `https://coins.bank.gov.ua/${coin}.html` })));
+    await vi.waitFor(() => expect(provider.prepare).toHaveBeenCalledTimes(1));
+    await scheduler.cancel(store.tasks()[0]!.id);
+    expect(preparationSignal.aborted).toBe(false);
+    expect(disconnect).not.toHaveBeenCalled();
+    release();
+    await vi.waitFor(() => expect(store.tasks().map(t => t.status)).toEqual(['cancelled', 'in_cart']));
+    await vi.waitFor(() => expect(disconnect).toHaveBeenCalledTimes(1));
+    expect(pool.connect).toHaveBeenCalledTimes(1);
+  } finally { release(); await scheduler.stop(); }
+});
+
+it('aborts shared preparation when the last waiting coin is cancelled', async () => {
+  const store = new Store(join(await mkdtemp(join(tmpdir(), 'nbu-cancel-pool-')), 'tasks.json'));
+  let preparationSignal!: AbortSignal;
+  const provider = { connect: vi.fn(), prepare: vi.fn((_id: string, _urls: string[], signal: AbortSignal) => {
+    preparationSignal = signal;
+    return new Promise<never>((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(Error('cancelled preparation')), { once: true });
+    });
+  }) };
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
+  try {
+    await scheduler.addMany(['one', 'two'].map((coin) => task({ saleAt: Date.now() + 60_000,
+      url: `https://coins.bank.gov.ua/${coin}.html` })));
+    await vi.waitFor(() => expect(provider.prepare).toHaveBeenCalledTimes(1));
+    await scheduler.cancel(store.tasks()[0]!.id);
+    expect(preparationSignal.aborted).toBe(false);
+    await scheduler.cancel(store.tasks()[1]!.id);
+    expect(preparationSignal.aborted).toBe(true);
+    expect(store.tasks().map(t => t.status)).toEqual(['cancelled', 'cancelled']);
   } finally { await scheduler.stop(); }
 });

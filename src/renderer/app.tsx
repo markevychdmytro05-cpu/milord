@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type DesktopApi, type SavedProfile, type Task, type TaskStatus } from '../core/model';
-import { nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
+import { kyivDateTimeInput, nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
 import '@fontsource-variable/inter/index.css';
 import './style.css';
 
@@ -93,14 +93,40 @@ function StatTile({ icon, label, value }: { icon: keyof typeof ICONS; label: str
 }
 
 interface CardProps {
-  task: Task; now: number; profileName: string; confirming: boolean; busy: boolean;
+  task: Task; now: number; profileName: string; confirming: boolean; busy: boolean; batchSize: number;
   onAsk: (id: string | null) => void; onStop: (id: string) => void;
+  onSave: (id: string, url: string, saleAt: number) => Promise<boolean>;
+  onReplan: (task: Task) => void;
 }
-function TaskCard({ task, now, profileName, confirming, busy, onAsk, onStop }: CardProps) {
+// A task that has not been picked up yet can be edited in place. One that is already running
+// is stopped first and its details move to the new-task form.
+const REPLANNABLE: TaskStatus[] = ['preparing', 'waiting', 'needs_attention', 'queued'];
+function TaskCard({ task, now, profileName, confirming, busy, batchSize, onAsk, onStop, onSave, onReplan }: CardProps) {
   const tone = tones[task.status];
   const upcoming = ['scheduled', 'preparing', 'waiting'].includes(task.status) && task.saleAt > now;
   const showNote = !!task.note && (task.status !== 'scheduled' || (task.batchIndex ?? 0) > 0);
   const stop = () => task.status === 'scheduled' ? onStop(task.id) : onAsk(task.id);
+  const initialSale = kyivDateTimeInput(task.saleAt).slice(0, 16);
+  const [mode, setMode] = useState<'view' | 'edit' | 'replan'>('view');
+  const [draftUrl, setDraftUrl] = useState(task.url);
+  const [draftSale, setDraftSale] = useState(initialSale);
+  const [problems, setProblems] = useState<{ url?: string; sale?: string }>({});
+  const canEdit = task.status === 'scheduled';
+  const canReplan = REPLANNABLE.includes(task.status) && task.clicks === 0;
+  const openEdit = () => { setDraftUrl(task.url); setDraftSale(initialSale); setProblems({}); setMode('edit'); };
+  async function save() {
+    const found: { url?: string; sale?: string } = {};
+    const urlError = urlProblem(draftUrl);
+    if (urlError) found.url = urlError;
+    let saleAt = task.saleAt;
+    try {
+      if (draftSale !== initialSale) saleAt = parseKyivDateTime(draftSale);
+      if (saleAt <= Date.now()) found.sale = 'Цей час уже минув. Оберіть майбутній.';
+    } catch (error) { found.sale = human(error, 'Вкажіть дату й час початку.'); }
+    setProblems(found);
+    if (found.url || found.sale) return;
+    if (await onSave(task.id, draftUrl.trim(), saleAt)) setMode('view');
+  }
   return <article className={`task ${tone}`}>
     <div className="task-top">
       <span className={`pill ${tone}`}>{labels[task.status]}</span>
@@ -111,7 +137,29 @@ function TaskCard({ task, now, profileName, confirming, busy, onAsk, onStop }: C
     <p className="meta">{when(task.saleAt, now)} за Києвом · {profileName}</p>
     {showNote && <p className="note">{task.note}</p>}
     {(task.reloads > 0 || task.clicks > 0) && <p className="hint">Оновлень: {task.reloads} · Натискань: {task.clicks}</p>}
-    {!isFinal(task.status) && (confirming
+    {mode === 'edit' && canEdit ? <div className="edit-form" role="group" aria-label="Зміна завдання">
+      <Field id={`edit-url-${task.id}`} label="Посилання на монету" error={problems.url}>
+        <input id={`edit-url-${task.id}`} type="url" value={draftUrl} aria-invalid={!!problems.url} autoComplete="off"
+          onChange={(e) => setDraftUrl(e.target.value)} />
+      </Field>
+      <Field id={`edit-sale-${task.id}`} label="Початок продажу, за київським часом" error={problems.sale}
+        hint={batchSize > 1 ? `Час зміниться для всіх ${batchSize} завдань, створених разом.` : undefined}>
+        <input id={`edit-sale-${task.id}`} type="datetime-local" step={60} value={draftSale} aria-invalid={!!problems.sale}
+          onChange={(e) => setDraftSale(e.target.value)} />
+      </Field>
+      <div className="actions">
+        <button type="button" disabled={busy} onClick={() => void save()}>Зберегти</button>
+        <button type="button" className="ghost" onClick={() => setMode('view')}>Скасувати</button>
+      </div>
+    </div>
+    : mode === 'replan' && canReplan ? <div className="confirm" role="group" aria-label="Підтвердження зміни">
+      <p>Щоб змінити, завдання треба зупинити. Дані перенесуться у форму «Нове завдання».</p>
+      <div className="actions">
+        <button type="button" className="danger" disabled={busy} onClick={() => { setMode('view'); onReplan(task); }}>Зупинити й змінити</button>
+        <button type="button" className="ghost" onClick={() => setMode('view')}>Ні</button>
+      </div>
+    </div>
+    : !isFinal(task.status) && (confirming
       ? <div className="confirm" role="group" aria-label="Підтвердження зупинки">
         <p>Зупинити завдання?{task.clicks > 0 && ' Товар, який уже в кошику, не буде видалено.'}</p>
         <div className="actions">
@@ -119,7 +167,11 @@ function TaskCard({ task, now, profileName, confirming, busy, onAsk, onStop }: C
           <button type="button" className="ghost" onClick={() => onAsk(null)}>Ні</button>
         </div>
       </div>
-      : <div className="actions"><button type="button" className="ghost" disabled={busy} onClick={stop}>Зупинити</button></div>)}
+      : <div className="actions">
+        {canEdit && <button type="button" className="ghost" disabled={busy} onClick={openEdit}>Змінити</button>}
+        {canReplan && <button type="button" className="ghost" disabled={busy} onClick={() => setMode('replan')}>Змінити</button>}
+        <button type="button" className="ghost" disabled={busy} onClick={stop}>Зупинити</button>
+      </div>)}
     <Journal task={task} />
   </article>;
 }
@@ -317,6 +369,26 @@ function App() {
       setNotice({ kind: 'ok', text: 'Налаштування збережено.' });
     });
   }
+  async function updateTask(id: string, taskUrl: string, saleAtMs: number): Promise<boolean> {
+    let saved = false;
+    await perform(async () => {
+      await window.desktop.updateTask({ id, url: taskUrl, saleAt: saleAtMs });
+      setNotice({ kind: 'ok', text: 'Завдання змінено.' });
+      saved = true;
+    });
+    return saved;
+  }
+  // Stop a running task and put its details back into the form so they can be corrected and planned again.
+  function replanTask(item: Task) {
+    setConfirmStop(null);
+    void perform(async () => {
+      await window.desktop.cancelTask(item.id);
+      setUrl(item.url); setExtraUrls([]); setErrors({}); setSaleAt(kyivDateTimeInput(item.saleAt).slice(0, 16));
+      if (options.some((profile) => profile.id === item.profileId)) setSelected([item.profileId]);
+      setNotice({ kind: 'info', text: 'Завдання зупинено. Змініть дані у формі й заплануйте знову.' });
+      setTimeout(() => document.getElementById('task-url')?.focus(), 0);
+    });
+  }
   function stopTask(id: string) {
     setConfirmStop(null);
     void perform(() => window.desktop.cancelTask(id));
@@ -408,7 +480,7 @@ function App() {
               </div>
             </Field>)}
             <button type="button" className="link add-coin" onClick={() => setExtraUrls((current) => [...current, ''])}>Додати монету</button>
-            {extraUrls.length > 0 && <p className="hint coin-order">У кожному профілі — по черзі, зверху вниз. Спільне вікно очікування: {state?.settings.windowMin ?? 5} хв після старту.</p>}
+            {extraUrls.length > 0 && <p className="hint coin-order">Кожна монета запускається незалежно у своїй вкладці. Спільне вікно очікування: {state?.settings.windowMin ?? 5} хв після старту.</p>}
             <Field id="task-sale" label="Початок продажу, за київським часом" hint={preview} error={errors.saleAt}>
               <input id="task-sale" name="saleAt" type="datetime-local" step={60} value={saleAt}
                 aria-invalid={!!errors.saleAt} aria-describedby={errors.saleAt ? 'task-sale-error' : 'task-sale-hint'}
@@ -451,10 +523,14 @@ function App() {
             <p>Вставте посилання на монету, оберіть час початку й профіль. Програма відкриє профіль заздалегідь і спрацює в момент старту.</p></div>}
           {attention.length > 0 && <div className="group"><h3 className="group-title attention">Потрібна ваша дія</h3>
             {attention.map((task) => <TaskCard key={task.id} task={task} now={now} profileName={profileName(task.profileId)} busy={busy}
-              confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask} />)}</div>}
+              confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask}
+              batchSize={task.batchId ? tasks.filter((item) => item.batchId === task.batchId && item.status === 'scheduled').length : 1}
+              onSave={updateTask} onReplan={replanTask} />)}</div>}
           {upcoming.length > 0 && <div className="group"><h3 className="group-title">Наступні</h3>
             {upcoming.map((task) => <TaskCard key={task.id} task={task} now={now} profileName={profileName(task.profileId)} busy={busy}
-              confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask} />)}</div>}
+              confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask}
+              batchSize={task.batchId ? tasks.filter((item) => item.batchId === task.batchId && item.status === 'scheduled').length : 1}
+              onSave={updateTask} onReplan={replanTask} />)}</div>}
           {history.length > 0 && <div className="group"><h3 className="group-title">Завершені · {history.length}</h3>
             <div className="history">{shownHistory.map((task) => <HistoryRow key={task.id} task={task} now={now} profileName={profileName(task.profileId)} />)}</div>
             {history.length > HISTORY_PREVIEW && <button type="button" className="link" onClick={() => setShowAllHistory(!showAllHistory)}>

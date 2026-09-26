@@ -7,6 +7,15 @@ export class ShopRateLimitError extends Error {
   }
 }
 
+// The message is written by us and is safe to show and save. Never build one from AdsPower or store text:
+// those can carry keys, addresses or cookies.
+export class UserFacingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserFacingError';
+  }
+}
+
 export function retryAfterMs(value: string | undefined, now: number): number {
   if (!value) return 0;
   if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;

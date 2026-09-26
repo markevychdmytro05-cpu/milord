@@ -48,6 +48,16 @@ export class Store {
     await this.flush();
   }
 
+  // Replace several tasks with one disk write, so a batch is never left half-changed.
+  async saveTasks(tasks: Task[]): Promise<void> {
+    const parsed = tasks.map((task) => taskSchema.parse(task));
+    for (const task of parsed) {
+      const index = this.document.tasks.findIndex((item) => item.id === task.id);
+      if (index !== -1) this.document.tasks[index] = task;
+    }
+    await this.flush();
+  }
+
   async saveSettings(settings: Settings): Promise<void> {
     this.document.settings = settingsSchema.parse(settings);
     await this.flush();

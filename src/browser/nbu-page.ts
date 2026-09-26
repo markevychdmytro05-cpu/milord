@@ -5,6 +5,23 @@ import type { PageState } from '../core/ports';
 
 export const BUY_BUTTON = 'form[name="cart_quantity"] #r_buy_intovar button[type="submit"].buy';
 
+// Read the store's rendered cart only. Do not open it, poll an endpoint or alter its queue.
+// A hidden popup can be stale, and a row with an expired reservation is not confirmation.
+export function readVisibleCartProductIds(): string[] {
+  const popup = document.querySelector<HTMLElement>('#modal_cart_popup');
+  if (!popup || !popup.getClientRects().length || getComputedStyle(popup).visibility !== 'visible') return [];
+  const ids: string[] = [];
+  for (const row of popup.querySelectorAll('.cartContent_body')) {
+    const id = row.querySelector<HTMLInputElement>('[name="products_id[]"]')?.value;
+    const quantity = Number(row.querySelector<HTMLSelectElement>('[name="cart_quantity[]"]')?.value);
+    const timer = row.querySelector('.cart-item-timer .timer-numbers')?.textContent?.replace(/\s/g, '');
+    const remaining = timer?.match(/^(\d+):(\d{2})$/);
+    if (id && /^\d+$/.test(id) && Number.isInteger(quantity) && quantity > 0 && remaining &&
+        Number(remaining[1]) * 60 + Number(remaining[2]) > 0) ids.push(id);
+  }
+  return [...new Set(ids)];
+}
+
 // This function runs in the page. Keep it self-contained for Playwright serialization.
 export function readNbuPage(click = false): PageState {
   const field = document.querySelector<HTMLInputElement>('[name="cid_id"]');

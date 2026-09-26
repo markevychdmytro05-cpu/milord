@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { AdsPowerClient, AdsPowerProvider, PreparationGate, responseClockOffset } from '../src/browser/adspower';
 import { ShopRequestGuard } from '../src/core/shop-errors';
 import { ready } from './helpers';
+import { readVisibleCartProductIds } from '../src/browser/nbu-page';
 
 const one = 'https://coins.bank.gov.ua/one.html';
 const two = 'https://coins.bank.gov.ua/two.html';
@@ -13,6 +14,7 @@ function fixture(existing: string[] = [], replies: Array<{ status: number; retry
   const frame = {};
   function createPage(initial = 'about:blank') {
     let url = initial; let status = 200;
+    let cartIds: string[] = [];
     const handlers = new Set<(response: Response) => void>();
     const request = async (target: string) => {
       url = target; requests.push({ url, at: Date.now() });
@@ -30,7 +32,8 @@ function fixture(existing: string[] = [], replies: Array<{ status: number; retry
       on: (_event: string, handler: (response: Response) => void) => handlers.add(handler),
       off: (_event: string, handler: (response: Response) => void) => handlers.delete(handler),
       goto: vi.fn(request), reload: vi.fn(() => request(url)),
-      evaluate: vi.fn(async () => ({ ...ready, rateLimited: status === 429 })),
+      setCartIds: (ids: string[]) => { cartIds = ids; },
+      evaluate: vi.fn(async (fn: unknown) => fn === readVisibleCartProductIds ? cartIds : ({ ...ready, rateLimited: status === 429 })),
     };
   }
   const pages = existing.map(createPage);
@@ -105,4 +108,63 @@ it('estimates time from the document header and rejects missing or extreme value
   expect(responseClockOffset('Thu, 01 Jan 1970 00:02:00 GMT', 120_500)).toBe(-500);
   expect(responseClockOffset(undefined, 120_500)).toBe(0);
   expect(responseClockOffset('Thu, 01 Jan 1970 00:02:00 GMT', 1_000_000)).toBe(0);
+});
+
+
+it('recognizes the selected product in another prepared tab cart without a new request', async () => {
+  const urls = ['https://coins.bank.gov.ua/one/p-1126.html', 'https://coins.bank.gov.ua/two/p-885.html'];
+  const { provider, pages, requests } = fixture(urls);
+  const signal = new AbortController().signal;
+  const pool = await provider.prepare('abc', urls, signal);
+  try {
+    const session = await pool.connect('abc', urls[1]!, signal);
+    pages[0]!.setCartIds(['1126']);
+    expect((await session.read()).inCart).toBe(false);
+    pages[0]!.setCartIds(['1126', '885']);
+    expect((await session.read()).inCart).toBe(true);
+    expect(requests).toHaveLength(0);
+  } finally { await pool.disconnect(); }
+});
+
+const oldOne = 'https://coins.bank.gov.ua/finished-1.html';
+const oldTwo = 'https://coins.bank.gov.ua/finished-2.html';
+
+it('leaves store tabs of earlier purchases untouched and opens its own tab', async () => {
+  const { provider, pages, requests, close } = fixture([oldOne, oldTwo]);
+  const pool = await provider.prepare('abc', [one], new AbortController().signal);
+  expect(requests.map((request) => request.url)).toEqual([one]);
+  expect(pages).toHaveLength(3);
+  expect(pages[2]!.url()).toBe(one);
+  for (const old of pages.slice(0, 2)) {
+    expect(old.goto).not.toHaveBeenCalled(); expect(old.reload).not.toHaveBeenCalled(); expect(old.bringToFront).not.toHaveBeenCalled();
+  }
+  expect(pages[0]!.url()).toBe(oldOne); expect(pages[1]!.url()).toBe(oldTwo);
+  expect(close).not.toHaveBeenCalled(); await pool.disconnect();
+});
+
+it('does not reuse a single unrelated store tab', async () => {
+  const { provider, pages } = fixture([oldOne]);
+  const pool = await provider.prepare('abc', [one], new AbortController().signal);
+  expect(pages).toHaveLength(2);
+  expect(pages[0]!.goto).not.toHaveBeenCalled();
+  expect(pages[0]!.url()).toBe(oldOne);
+  await pool.disconnect();
+});
+
+it('waits for a purchase still in flight in another store tab, changing nothing', async () => {
+  const { provider, pages, requests, close } = fixture([oldOne]);
+  pages[0]!.evaluate.mockResolvedValue({ ...ready, buyAvailable: false, purchasePending: true });
+  await expect(provider.prepare('abc', [one], new AbortController().signal)).rejects.toThrow('триває покупка');
+  expect(requests).toHaveLength(0); expect(pages).toHaveLength(1);
+  expect(close).toHaveBeenCalledTimes(1);
+});
+
+it('does not let a stale 429 page in an unrelated tab pause the bot or reload that tab', async () => {
+  const { provider, guard, pages, requests } = fixture([oldOne]);
+  pages[0]!.evaluate.mockResolvedValue({ ...ready, buyAvailable: false, rateLimited: true });
+  const pool = await provider.prepare('abc', [one], new AbortController().signal);
+  expect(guard.isBlocked()).toBe(false);
+  expect(pages[0]!.reload).not.toHaveBeenCalled();
+  expect(requests.map((request) => request.url)).toEqual([one]);
+  await pool.disconnect();
 });
