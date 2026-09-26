@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdsPowerClient, validateCdpEndpoint } from '../src/browser/adspower';
+import { AdsPowerClient, compensateForLatency, responseClockOffset, validateCdpEndpoint } from '../src/browser/adspower';
 import { productUrl, taskInputSchema } from '../src/core/model';
 import { task } from './helpers';
 
@@ -7,6 +7,29 @@ const failureOf = async (attempt: Promise<unknown>): Promise<Error> => {
   try { await attempt; } catch (error) { return error as Error; }
   throw new Error('expected the call to fail');
 };
+
+describe('clock offset estimation', () => {
+  it('keeps the receipt time when no request time was recorded', () => {
+    expect(compensateForLatency(10_000, undefined)).toBe(10_000);
+  });
+
+  it('shifts the receipt time back by half the round trip', () => {
+    expect(compensateForLatency(10_400, 10_000)).toBe(10_200);
+  });
+
+  it('never looks earlier than the request itself, even with a clock glitch', () => {
+    expect(compensateForLatency(9_900, 10_000)).toBe(9_900);
+  });
+
+  it('reduces the offset error introduced by a slow round trip', () => {
+    // Server clock reads exactly 10_000; the request took 800ms round trip.
+    const date = new Date(10_000).toUTCString();
+    const receivedAt = 10_800;
+    const uncompensated = responseClockOffset(date, receivedAt);
+    const compensated = responseClockOffset(date, compensateForLatency(receivedAt, 10_000));
+    expect(Math.abs(compensated)).toBeLessThan(Math.abs(uncompensated));
+  });
+});
 
 describe('AdsPower Local API adapter', () => {
   it('starts the selected profile and uses its CDP endpoint', async () => {
@@ -133,4 +156,28 @@ it('spaces shared API requests and skips cancelled requests', async () => {
     await next;
     expect(request).toHaveBeenCalledTimes(2);
   } finally { vi.useRealTimers(); }
+});
+
+it('checks an existing browser without starting it and uses only its local CDP endpoint', async () => {
+  const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+    code: 0, data: { status: 'Active', ws: { puppeteer: 'ws://localhost:54321/devtools/browser/test' } },
+  })));
+  const client = new AdsPowerClient('http://localhost:50325', 'test-key', request);
+  expect(await client.active('abc', new AbortController().signal)).toContain('54321');
+  expect(new URL(String(request.mock.calls[0]![0])).pathname).toBe('/api/v1/browser/active');
+  expect(request.mock.calls[0]![1]?.headers).toEqual({ Authorization: 'Bearer test-key' });
+  expect(request).toHaveBeenCalledTimes(1);
+});
+it('leaves inactive browsers closed', async () => {
+  const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: { status: 'Inactive' } })));
+  expect(await new AdsPowerClient('http://localhost:50325', '', request).active('abc', new AbortController().signal)).toBeUndefined();
+  expect(request).toHaveBeenCalledTimes(1);
+});
+it('does not leak raw status errors or connect to external browser endpoints', async () => {
+  for (const body of [{ code: -1, msg: 'private-secret' },
+    { code: 0, data: { status: 'Active', ws: { puppeteer: 'wss://private-secret.example/browser' } } }]) {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(body)));
+    const error = await failureOf(new AdsPowerClient('http://localhost:50325', '', request).active('abc', new AbortController().signal));
+    expect(error.message).not.toContain('private-secret');
+  }
 });

@@ -1,9 +1,12 @@
 import { chromium, type Browser, type Page, type Response } from 'playwright-core';
 import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
+import { intersectBounds, responseOffsetBounds, type OffsetBounds } from '../core/clock-bounds';
 import type { BrowserProvider, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
+import type { NbuLogin } from './nbu-login';
+import type { PageRecorder } from './page-recorder';
 import { assertShopPage, readNbuPage, readVisibleCartProductIds, waitForActionablePage } from './nbu-page';
 
 const startResponse = z.object({
@@ -84,6 +87,32 @@ export class AdsPowerClient {
     throw new Error('Список завеликий. Підтримується до 10 000 профілів.');
   }
 
+  // Query only: cabinet reads must never launch a profile or bring its window forward.
+  async active(profileId: string, signal: AbortSignal): Promise<string | undefined> {
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profileId)) throw new Error('Invalid profile ID');
+    await this.startGate.wait(signal);
+    const url = new URL('/api/v1/browser/active', this.base);
+    url.searchParams.set('user_id', profileId);
+    try {
+      const response = await this.request(url, {
+        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+        signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]), redirect: 'error',
+      });
+      if (response.status === 401 || response.status === 403) throw new UserFacingError('AdsPower відхилив запит. Перевірте API-ключ у налаштуваннях.');
+      if (!response.ok) throw new UserFacingError(`AdsPower Local API відповів помилкою (HTTP ${response.status}).`);
+      const result = z.object({ code: z.literal(0), data: z.object({ status: z.enum(['Active', 'Inactive']),
+        ws: z.object({ puppeteer: z.string() }).optional(),
+      }) }).safeParse(await response.json());
+      if (!result.success) throw new UserFacingError('AdsPower не надав стан профілю. Перевірте ID профілю та доступ до Local API.');
+      if (result.data.data.status === 'Inactive') return undefined;
+      if (!result.data.data.ws) throw new UserFacingError('AdsPower не надав адресу відкритого профілю.');
+      return validateCdpEndpoint(result.data.data.ws.puppeteer);
+    } catch (error) {
+      if (signal.aborted || error instanceof UserFacingError) throw error;
+      throw new UserFacingError('Не вдалося перевірити відкритий профіль. Перевірте AdsPower і Local API.');
+    }
+  }
+
   async start(profileId: string, signal: AbortSignal): Promise<string> {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profileId)) throw new Error('Invalid profile ID');
     await this.startGate.wait(signal);
@@ -147,15 +176,26 @@ export function responseClockOffset(date: string | undefined, receivedAt: number
   return Number.isFinite(offset) && Math.abs(offset) <= 300_000 ? Math.round(offset) : 0;
 }
 
+// The Date header reflects the server's clock when it started building the response, not when
+// we received it. Assuming a symmetric round trip, the midpoint of the request is a closer match
+// than the raw receipt time. No extra request: this reuses the navigation we already made.
+export function compensateForLatency(receivedAt: number, sentAt: number | undefined): number {
+  if (sentAt === undefined || !Number.isFinite(sentAt)) return receivedAt;
+  const rtt = Math.max(0, receivedAt - sentAt);
+  return receivedAt - rtt / 2;
+}
+
 export class AdsPowerProvider implements BrowserProvider {
   constructor(private readonly client: AdsPowerClient,
     private readonly guard = new ShopRequestGuard(),
-    private readonly preparationGate = new PreparationGate()) {}
+    private readonly preparationGate = new PreparationGate(),
+    private readonly login?: NbuLogin,
+    private readonly recorder?: PageRecorder) {}
 
   async connect(profileId: string, url: string, signal: AbortSignal, options?: PreparationOptions): Promise<ShopSession> {
     const prepared = await this.prepare(profileId, [url], signal, options);
     try {
-      const session = await prepared.connect(profileId, url, signal);
+      const session = await prepared.connect(profileId, url, signal, options);
       return { ...session, disconnect: () => prepared.disconnect() };
     } catch (error) { await prepared.disconnect(); throw error; }
   }
@@ -169,6 +209,11 @@ export class AdsPowerProvider implements BrowserProvider {
     let browser: Browser | undefined;
     const listeners: Array<{ page: Page; handler: (response: Response) => void }> = [];
     const offsets = new Map<Page, number>();
+    const offsetBounds = new Map<Page, OffsetBounds>();
+    const navigationStatuses = new Map<Page, number>();
+    const navigationSentAt = new Map<Page, number>();
+    const goto = (page: Page, url: string) => { navigationSentAt.set(page, Date.now()); return page.goto(url, { waitUntil: 'domcontentloaded' }); };
+    const reload = (page: Page) => { navigationSentAt.set(page, Date.now()); return page.reload({ waitUntil: 'domcontentloaded' }); };
     const pages = new Map<string, Page>();
     const deadline = options?.deadline ?? Date.now() + 300_000;
     const seenResponses = new WeakSet<Response>();
@@ -185,17 +230,27 @@ export class AdsPowerProvider implements BrowserProvider {
             new URL(candidate.url()).origin === url.origin)
             .map((candidate) => candidate.evaluate(readVisibleCartProductIds).catch((): string[] => [])));
           state.inCart = carts.some((ids) => ids.includes(id));
+          if (state.inCart) state.cartConfirmation = 'visible-cart';
         }
       }
-      return { ...state, rateLimited: !state.inCart && (state.rateLimited || this.guard.isBlocked()) };
+      return { ...state, navigationHttpStatus: navigationStatuses.get(page), sharedRateLimit: this.guard.isBlocked(),
+        rateLimited: !state.inCart && (state.rateLimited || this.guard.isBlocked()) };
     };
     const observeResponse = (page: Page, response: Response) => {
       if (seenResponses.has(response)) return;
       seenResponses.add(response);
       if (new URL(response.url()).origin !== 'https://coins.bank.gov.ua') return;
       if (response.status() === 429) this.guard.block(response.headers()['retry-after']);
+      if (response.request().isNavigationRequest() && response.request().frame() === page.mainFrame()) {
+        navigationStatuses.set(page, response.status());
+      }
       if (response.request().isNavigationRequest() && response.request().frame() === page.mainFrame() && response.ok()) {
-        offsets.set(page, responseClockOffset(response.headers().date, Date.now()));
+        const receivedAt = Date.now();
+        offsets.set(page, responseClockOffset(response.headers().date,
+          compensateForLatency(receivedAt, navigationSentAt.get(page))));
+        const bounds = responseOffsetBounds(response.headers().date, navigationSentAt.get(page), receivedAt);
+        const previous = offsetBounds.get(page);
+        if (bounds) offsetBounds.set(page, intersectBounds(previous ? [bounds, previous] : [bounds])!);
       }
     };
     const recover = async (page: Page, recoverySignal: AbortSignal, until: number) => {
@@ -211,7 +266,7 @@ export class AdsPowerProvider implements BrowserProvider {
         return this.preparationGate.run(recoverySignal, async () => {
           await this.guard.wait(recoverySignal, until);
           reloaded = true;
-          const response = await page.reload({ waitUntil: 'domcontentloaded' });
+          const response = await reload(page);
           if (response) observeResponse(page, response);
           const next = await page.evaluate(readNbuPage, false);
           if (next.rateLimited) this.guard.block();
@@ -281,7 +336,7 @@ export class AdsPowerProvider implements BrowserProvider {
           if (this.guard.isBlocked()) await options?.onRateLimit?.();
           await this.guard.retry(signal, deadline, () => this.preparationGate.run(signal, async () => {
             await this.guard.wait(signal, deadline);
-            const response = await page.goto(target, { waitUntil: 'domcontentloaded' });
+            const response = await goto(page, target);
             if (response) observeResponse(page, response);
             const state = await page.evaluate(readNbuPage, false);
             if (state.rateLimited) this.guard.block();
@@ -295,7 +350,7 @@ export class AdsPowerProvider implements BrowserProvider {
       let disconnected = false;
       await pages.get(targets[0]!)!.bringToFront();
       return {
-        connect: async (requestedProfile, url, taskSignal) => {
+        connect: async (requestedProfile, url, taskSignal, taskOptions) => {
           if (disconnected || requestedProfile !== profileId) throw new Error('Prepared profile is unavailable');
           const target = productUrl(url);
           const page = pages.get(target);
@@ -303,6 +358,12 @@ export class AdsPowerProvider implements BrowserProvider {
           const check = () => { taskSignal.throwIfAborted(); };
           check();
           await page.bringToFront();
+          const recording = taskOptions?.capture && this.recorder?.forTask(taskOptions.capture.taskId, taskOptions.capture.saleAt);
+          if (recording) {
+            const handler = (response: Response) => recording.response(response);
+            page.on('response', handler);
+            listeners.push({ page, handler });
+          }
           // Handoff reuses the prepared tab: no AdsPower start, new tab or goto.
           return {
             prepared: true,
@@ -317,16 +378,33 @@ export class AdsPowerProvider implements BrowserProvider {
               const state = await waitForActionablePage(page, Math.min(1000, timeoutMs));
               if (state.rateLimited && !this.guard.isBlocked()) this.guard.block();
               check(); assertShopPage(page, target);
-              return { ...state, rateLimited: state.rateLimited || this.guard.isBlocked() };
+              return { ...state, navigationHttpStatus: navigationStatuses.get(page), sharedRateLimit: this.guard.isBlocked(),
+                rateLimited: state.rateLimited || this.guard.isBlocked() };
             },
-            // Reuse the Date header of the ordinary document response. No HEAD probes.
+            // Reuse the Date header of the ordinary document response, latency-compensated. No HEAD probes.
             serverOffset: async () => { check(); return offsets.get(page) ?? 0; },
+            serverOffsetBounds: async () => { check(); return offsetBounds.get(page); },
             reload: async () => {
               check(); assertShopPage(page, target);
               if (this.guard.isBlocked()) return; // The buyer will enter the shared recovery loop.
-              const response = await page.reload({ waitUntil: 'domcontentloaded' });
+              const response = await reload(page);
               if (response) observeResponse(page, response);
-              check(); await readState(page);
+              check(); // The buyer reads the fresh page next; a second read here only delays the click.
+            },
+            login: async () => {
+              check(); assertShopPage(page, target);
+              if (!this.login?.available(profileId)) return false;
+              await this.login.ensure(context, profileId, taskSignal);
+              check(); assertShopPage(page, target);
+              await this.guard.wait(taskSignal, deadline);
+              const response = await reload(page);
+              if (response) observeResponse(page, response);
+              check();
+              return true;
+            },
+            capture: async (request) => {
+              if (!recording || page.isClosed()) return;
+              await recording.snapshot(page, request);
             },
             clickBuy: async () => {
               check(); this.guard.check(); assertShopPage(page, target); await page.evaluate(readNbuPage, true);

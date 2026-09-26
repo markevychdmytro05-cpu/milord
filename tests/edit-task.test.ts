@@ -46,7 +46,7 @@ it('does nothing and does not journal when nothing changed', async () => {
   const { store, scheduler, saleAt } = await setup();
   const item = of(store, 'a', 'one');
   await scheduler.update(item.id, { url: item.url, saleAt });
-  expect(store.tasks().find((entry) => entry.id === item.id)!.events).toHaveLength(0);
+  expect(store.tasks().find((entry) => entry.id === item.id)!.events).toEqual(item.events);
 });
 
 it('rejects a past time, a bad link, a duplicate coin and an unknown task without changing anything', async () => {

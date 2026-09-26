@@ -23,7 +23,21 @@ describe('NBU page recognition from the ported selectors', () => {
   });
   it.each(['clicked', 'limited'])('does not reuse a %s button', (className) => {
     page().querySelector('button')!.classList.add(className);
-    expect(readNbuPage().buyAvailable).toBe(false);
+    expect(readNbuPage()).toMatchObject({ buyAvailable: false, buyUnavailableReason: className === 'clicked' ? 'pending' : 'limited' });
+  });
+  it.each([
+    ['form', 'missing-form'], ['[name="products_id"]', 'missing-product'], ['button', 'missing-button'],
+  ])('explains missing purchase elements: %s', (selector, reason) => {
+    page().querySelector(selector)!.remove();
+    expect(readNbuPage()).toMatchObject({ buyAvailable: false, buyUnavailableReason: reason });
+  });
+  it('distinguishes a disabled button from a hidden one', () => {
+    const button = page().querySelector('button')!;
+    button.disabled = true;
+    expect(readNbuPage().buyUnavailableReason).toBe('disabled-button');
+    button.disabled = false;
+    button.style.visibility = 'hidden';
+    expect(readNbuPage().buyUnavailableReason).toBe('hidden-button');
   });
   it('recognizes a login link and a cart confirmation', () => {
     page('<a class="login">Увійти</a><a href="shopping_cart.php">Кошик</a>');

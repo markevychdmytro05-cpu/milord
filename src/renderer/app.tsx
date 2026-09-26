@@ -1,9 +1,13 @@
-import { useEffect, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type DesktopApi, type SavedProfile, type Task, type TaskStatus } from '../core/model';
 import { kyivDateTimeInput, nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
 import '@fontsource-variable/inter/index.css';
 import './style.css';
+import { summarizeSales, type SaleSummary } from '../core/sale-summary';
+import { Cabinet } from './cabinet';
+import { NbuAccountEditor, NbuAccountToggle } from './nbu-account';
+import { BehaviorTest } from './behavior-test';
 
 declare global { interface Window { desktop: DesktopApi } }
 
@@ -20,6 +24,8 @@ const tones: Record<TaskStatus, Tone> = {
 const PROFILE_ID = /^[a-zA-Z0-9_-]{1,80}$/;
 const IPC_PREFIX = /^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/;
 const HISTORY_PREVIEW = 5;
+const NAV_TABS = ['cabinet', 'tasks', 'settings'] as const;
+const NAV_LABELS = { cabinet: 'Кабінет', tasks: 'Завдання', settings: 'Налаштування' };
 
 const human = (error: unknown, fallback: string) =>
   error instanceof Error ? error.message.replace(IPC_PREFIX, '').trim() || fallback : fallback;
@@ -74,11 +80,13 @@ function Field({ id, label, hint, error, children }: { id: string; label: string
 }
 
 const ICONS = {
+  cabinet: <><rect x="5" y="5" width="14" height="16" rx="2" /><path d="M9 5V3h6v2M9 10h6M9 14h6" /></>,
   list: <path d="M4 6h16M4 12h16M4 18h10" />,
   sliders: <><path d="M4 7h9M19 7h1M4 17h1M11 17h9" /><circle cx="16" cy="7" r="2.2" /><circle cx="8" cy="17" r="2.2" /></>,
   link: <><circle cx="6" cy="12" r="2.4" /><circle cx="18" cy="6" r="2.4" /><circle cx="18" cy="18" r="2.4" /><path d="M8.2 10.8l7.6-3.6M8.2 13.2l7.6 3.6" /></>,
   users: <><circle cx="9" cy="8" r="3" /><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6" /><path d="M16 5.4a3 3 0 010 5.2M18 14.4c1.8.8 3 2.6 3 5.6" /></>,
   clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></>,
+  sync: <><path d="M4 4v6h6M20 20v-6h-6" /><path d="M5.5 9A7 7 0 0118 8M18.5 15A7 7 0 016 16" /></>,
   play: <path d="M8 5l11 7-11 7z" />,
   check: <path d="M5 12.5l4.5 4.5L19 7.5" />,
   cross: <path d="M6 6l12 12M18 6L6 18" />,
@@ -108,6 +116,7 @@ function TaskCard({ task, now, profileName, confirming, busy, batchSize, onAsk, 
   const stop = () => task.status === 'scheduled' ? onStop(task.id) : onAsk(task.id);
   const initialSale = kyivDateTimeInput(task.saleAt).slice(0, 16);
   const [mode, setMode] = useState<'view' | 'edit' | 'replan'>('view');
+  const [collapsed, setCollapsed] = useState(false);
   const [draftUrl, setDraftUrl] = useState(task.url);
   const [draftSale, setDraftSale] = useState(initialSale);
   const [problems, setProblems] = useState<{ url?: string; sale?: string }>({});
@@ -127,14 +136,19 @@ function TaskCard({ task, now, profileName, confirming, busy, batchSize, onAsk, 
     if (found.url || found.sale) return;
     if (await onSave(task.id, draftUrl.trim(), saleAt)) setMode('view');
   }
-  return <article className={`task ${tone}`}>
+  return <article className={`task ${tone}${collapsed ? ' collapsed' : ''}`}>
     <div className="task-top">
       <span className={`pill ${tone}`}>{labels[task.status]}</span>
-      {task.mode === 'observe' && <span className="mode-tag">Спостереження</span>}
+      <div className="task-identity">
+        <h3 className="task-title" title={task.url}>{coinTitle(task.url)}</h3>
+        <p className="meta">{when(task.saleAt, now)} за Києвом · {profileName}</p>
+      </div>
       {upcoming && <span className="countdown"><span className="cap">до старту</span> <strong>{span(task.saleAt - now)}</strong></span>}
+      <button type="button" className="ghost task-toggle" aria-expanded={!collapsed} aria-controls={`task-body-${task.id}`}
+        onClick={() => setCollapsed(value => !value)}>{collapsed ? 'Розгорнути' : 'Згорнути'}</button>
     </div>
-    <h3 className="task-title" title={task.url}>{coinTitle(task.url)}</h3>
-    <p className="meta">{when(task.saleAt, now)} за Києвом · {profileName}</p>
+    <div className="task-body" id={`task-body-${task.id}`} hidden={collapsed}>
+    {task.mode === 'observe' && <span className="mode-tag">Спостереження</span>}
     {showNote && <p className="note">{task.note}</p>}
     {(task.reloads > 0 || task.clicks > 0) && <p className="hint">Оновлень: {task.reloads} · Натискань: {task.clicks}</p>}
     {mode === 'edit' && canEdit ? <div className="edit-form" role="group" aria-label="Зміна завдання">
@@ -173,13 +187,50 @@ function TaskCard({ task, now, profileName, confirming, busy, batchSize, onAsk, 
         <button type="button" className="ghost" disabled={busy} onClick={stop}>Зупинити</button>
       </div>)}
     <Journal task={task} />
+    </div>
   </article>;
 }
-function Journal({ task }: { task: Task }) {
-  if (!task.events.length) return null;
-  return <details className="journal"><summary>Журнал ({task.events.length})</summary>
-    <ul>{task.events.map((entry, i) => <li key={i}><time>{stamp(entry.at)}</time> {entry.message}</li>)}</ul></details>;
+function downloadJournal(task: Task) {
+  const report = { exportedAt: new Date().toISOString(), timeZone: SALE_TIME_ZONE, retainedEvents: 200, ...task };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `nbu-journal-${task.profileId}-${task.id}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+function Journal({ task }: { task: Task }) {
+  const consoleRef = useRef<HTMLDivElement>(null);
+  const followLatest = useRef(true);
+  const latest = task.events.at(-1);
+  const scrollToLatest = () => {
+    const console = consoleRef.current;
+    if (console && followLatest.current) console.scrollTop = console.scrollHeight;
+  };
+  useEffect(scrollToLatest, [task.events.length, latest?.at, latest?.message]);
+  return <details className="journal" open onToggle={scrollToLatest}>
+    <summary>Журнал ({task.events.length})</summary>
+    <div className="log-console" ref={consoleRef} role="log" aria-label={`Логи ${coinTitle(task.url)} · ${task.profileId}`}
+      aria-live="off" tabIndex={0} onScroll={(event) => {
+        const console = event.currentTarget;
+        followLatest.current = console.scrollHeight - console.scrollTop - console.clientHeight < 24;
+      }}>
+      {!task.events.length && <p className="log-empty">Очікуємо першу подію…</p>}
+      {task.events.map((entry, i) => <div className={`log-line log-${entry.details?.status ?? 'info'}`} key={i}>
+        <time dateTime={new Date(entry.at).toISOString()}>{dayKey(entry.at)} {stamp(entry.at)}.{String(entry.at % 1000).padStart(3, '0')}</time>
+        <span className="log-message">{entry.message}</span>
+        {entry.details && <details className="journal-data"><summary>
+          {entry.details.phase} · спроб: {entry.details.clicks} · оновлень: {entry.details.reloads}
+        </summary><pre>{JSON.stringify(entry.details, null, 2)}</pre></details>}
+      </div>)}
+    </div>
+    <div className="journal-tools">
+      <p className="hint">Останні 200 подій · час за Києвом</p>
+      <button type="button" className="ghost" onClick={() => downloadJournal(task)}>Завантажити журнал</button>
+    </div>
+  </details>;
+}
+
 function HistoryRow({ task, now, profileName }: { task: Task; now: number; profileName: string }) {
   const tone = tones[task.status];
   return <details className={`hist ${tone}`}>
@@ -197,10 +248,46 @@ function HistoryRow({ task, now, profileName }: { task: Task; now: number; profi
   </details>;
 }
 
+// Seconds from the sale start by the server clock, e.g. "+1,24 с".
+const offsetSec = (ms: number | undefined) => ms === undefined ? '—'
+  : `${ms < 0 ? '−' : '+'}${(Math.abs(ms) / 1000).toLocaleString('uk-UA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} с`;
+function SaleSummaryView({ sale, now, open, profileName }: { sale: SaleSummary; now: number; open: boolean; profileName: (id: string) => string }) {
+  const coins = new Set(sale.rows.map((row) => row.url)).size;
+  return <details className="sale" open={open}>
+    <summary>
+      <span className="hist-line"><span className="hist-title">Продаж {when(sale.saleAt, now)}</span>
+        <span className={`pill ${sale.inCart ? 'good' : sale.finished ? 'muted' : 'live'}`}>{sale.inCart}/{sale.total} у кошику</span></span>
+      <span className="sale-stats">
+        Кнопка вперше: <b>{offsetSec(sale.earliestButtonMs)}</b>{sale.medianButtonMs !== undefined && <> · медіана {offsetSec(sale.medianButtonMs)}</>}
+        {sale.medianCartMs !== undefined && <> · кошик, медіана: <b>{offsetSec(sale.medianCartMs)}</b></>}
+      </span>
+    </summary>
+    <div className="sale-scroll"><table className="sale-table">
+      <thead><tr><th>Профіль{coins > 1 && ' · монета'}</th><th>Результат</th>
+        <th title="Коли бот уперше побачив кнопку «Купити» та скільки оновлень сторінки знадобилось">Кнопка</th>
+        <th title="Перше натискання «Купити»">Клік</th><th title="Підтвердження кошика">Кошик</th></tr></thead>
+      <tbody>{sale.rows.map((row) => <tr key={row.taskId}>
+        <td><span className="sale-profile">{profileName(row.profileId)}</span>{coins > 1 && <span className="sale-coin">{coinTitle(row.url)}</span>}</td>
+        <td><span className={`pill ${tones[row.status]}`}>{labels[row.status]}</span>
+          {row.status !== 'in_cart' && row.note && <span className="sale-reason">{row.note}</span>}</td>
+        <td className="num">{row.buttonSeenMs === undefined && row.mode === 'cart' && row.reloads ? 'не було' : offsetSec(row.buttonSeenMs)}
+          {(row.buttonReloads ?? (row.buttonSeenMs === undefined ? row.reloads : undefined)) !== undefined && (() => {
+            const count = row.buttonReloads ?? row.reloads;
+            return <span className="sale-sub">{count} {plural(count, 'оновлення', 'оновлення', 'оновлень')}</span>;
+          })()}</td>
+        <td className="num">{offsetSec(row.firstClickMs)}{row.clicks > 1 && <span className="sale-sub">{row.clicks} кліки</span>}</td>
+        <td className="num">{offsetSec(row.cartMs)}</td>
+      </tr>)}</tbody>
+    </table></div>
+    <p className="hint sale-hint">Час — від старту продажу за годинником сервера НБУ. Повний журнал кожного профілю — у «Завершених».{' '}
+      <button type="button" className="link" onClick={() => void window.desktop.openCaptures().catch(() => {})}>Записи сторінок</button></p>
+  </details>;
+}
+
 function App() {
   const [state, setState] = useState<AppState>();
   const [now, setNow] = useState(Date.now());
-  const [tab, setTab] = useState<'tasks' | 'settings'>('tasks');
+  const [tab, setTab] = useState<typeof NAV_TABS[number]>('tasks');
   const [notice, setNotice] = useState<{ kind: 'ok' | 'info' | 'error'; text: string }>();
   const [busy, setBusy] = useState(false);
   const [inspecting, setInspecting] = useState('');
@@ -226,6 +313,7 @@ function App() {
   // Task list
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
+  const [accountOpen, setAccountOpen] = useState('');
 
   useEffect(() => {
     let alive = true;
@@ -343,7 +431,7 @@ function App() {
     catch (error) {
       found.apiUrl = error instanceof TypeError || !(error instanceof Error) ? 'Вкажіть адресу, наприклад http://127.0.0.1:50325.' : error.message;
     }
-    const ranges = { leadMin: [1, 60], retrySec: [5, 60], windowMin: [1, 30] } as const;
+    const ranges = { leadMin: [1, 60], retrySec: [1, 60], windowMin: [1, 30] } as const;
     for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
       const problem = rangeProblem(nums[key], ranges[key][0], ranges[key][1]);
       if (problem) found[key] = problem;
@@ -395,7 +483,9 @@ function App() {
   }
   function moveTab(event: KeyboardEvent<HTMLButtonElement>) {
     if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
-    const next = tab === 'tasks' ? 'settings' : 'tasks';
+    event.preventDefault();
+    const direction = ['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1;
+    const next = NAV_TABS[(NAV_TABS.indexOf(tab) + direction + NAV_TABS.length) % NAV_TABS.length]!;
     setTab(next);
     document.getElementById(`tab-${next}`)?.focus();
   }
@@ -405,6 +495,7 @@ function App() {
   const upcoming = tasks.filter((task) => !isFinal(task.status) && task.status !== 'needs_attention').sort((a, b) => a.saleAt - b.saleAt);
   const history = tasks.filter((task) => isFinal(task.status)).sort((a, b) => b.updatedAt - a.updatedAt);
   const shownHistory = showAllHistory ? history : history.slice(0, HISTORY_PREVIEW);
+  const sales = summarizeSales(tasks, now, 5);
   const open = attention.length + upcoming.length;
   const keyStatus = state?.savedApiKey ? 'Ключ збережено' : state?.hasApiKey ? 'Ключ із середовища' : 'Ключ не задано';
   const today = tasks.filter((task) => dayKey(task.saleAt) === dayKey(now));
@@ -417,6 +508,20 @@ function App() {
   const successRate = settled.length ? Math.round(tasks.filter((task) => task.status === 'in_cart').length / settled.length * 100) : null;
   const apiDot = profilesError ? 'bad' : state?.hasApiKey ? 'good' : 'idle';
   const apiText = profilesError ? 'Помилка' : state?.savedApiKey ? 'Ключ є' : state?.hasApiKey ? 'З середовища' : 'Немає ключа';
+  // Different profiles ride different network paths and carry different typical offsets
+  // (a live test found a stable ~200ms gap between two profiles) — never pooled together.
+  // With many saved profiles a row-per-profile list would swallow the whole sidebar, so this
+  // stays one row: the freshest reading plus a "+N" hint, red if ANY profile looks anomalous
+  // (never masked by a fine-looking recent one), full per-profile breakdown in the tooltip.
+  const offsetEntries = Object.entries(state?.offsetHistoryByProfile ?? {})
+    .sort(([, a], [, b]) => b.lastAt - a.lastAt);
+  const [, topOffset] = offsetEntries[0] ?? [];
+  const offsetDot = !offsetEntries.length ? 'idle' : offsetEntries.some(([, s]) => s.anomaly) ? 'bad' : 'good';
+  const offsetText = !topOffset ? '–'
+    : `${topOffset.lastMs > 0 ? '+' : ''}${topOffset.lastMs} мс${offsetEntries.length > 1 ? ` +${offsetEntries.length - 1}` : ''}`;
+  const offsetTitle = !offsetEntries.length ? 'Замір з’являється після першого підключення до сторінки монети.'
+    : offsetEntries.map(([id, s]) => `${profileName(id)}: ${s.lastMs > 0 ? '+' : ''}${s.lastMs} мс · ` +
+      `середнє ${s.meanMs} мс · замірів ${s.count} · останній ${when(s.lastAt, now)}${s.anomaly ? ' · АНОМАЛІЯ' : ''}`).join('\n');
   const kyivClock = new Date(now).toLocaleTimeString('uk-UA', { timeZone: SALE_TIME_ZONE });
   const preview = (() => {
     try {
@@ -429,11 +534,11 @@ function App() {
     <aside className="side">
       <div className="brand"><span className="mark" aria-hidden="true">N</span><span className="brand-name">NBU Desktop</span></div>
       <nav aria-label="Розділи додатка"><div role="tablist" aria-orientation="vertical">
-        {(['tasks', 'settings'] as const).map((name) => <button key={name} id={`tab-${name}`} role="tab" type="button"
+        {NAV_TABS.map((name) => <button key={name} id={`tab-${name}`} role="tab" type="button"
           aria-selected={tab === name} aria-controls={`panel-${name}`} tabIndex={tab === name ? 0 : -1}
           onKeyDown={moveTab} onClick={() => setTab(name)}>
-          <Icon name={name === 'tasks' ? 'list' : 'sliders'} />
-          <span className="tab-label">{name === 'tasks' ? 'Завдання' : 'Налаштування'}</span>
+          <Icon name={name === 'cabinet' ? 'cabinet' : name === 'tasks' ? 'list' : 'sliders'} />
+          <span className="tab-label">{NAV_LABELS[name]}</span>
           {name === 'tasks' && open > 0 && <span className={`count ${attention.length ? 'attention' : ''}`}>{open}</span>}
         </button>)}
       </div></nav>
@@ -442,6 +547,8 @@ function App() {
         <div className="sys-row"><Icon name="link" /><span>AdsPower API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
         <div className="sys-row"><Icon name="users" /><span>Профілі</span><span className="sys-val">{profiles.length} / {options.length}</span></div>
         <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val mono">{kyivClock}</span></div>
+        <div className="sys-row" title={offsetTitle}><Icon name="sync" /><span>Зсув сервера</span>
+          <span className="sys-val"><i className={`dot ${offsetDot}`} />{offsetText}</span></div>
       </section>
       <section className="side-block" aria-label="Статистика за сьогодні">
         <h2 className="cap">Статистика (сьогодні)</h2>
@@ -453,7 +560,7 @@ function App() {
     </aside>
     <main>
     <header className="strip">
-      <h1>{tab === 'tasks' ? 'Завдання' : 'Налаштування'}</h1>
+      <h1>{NAV_LABELS[tab]}</h1>
       {tab === 'tasks' && <div className="segs" aria-label="Підсумок">
         <div className="seg"><strong>{upcoming.length}</strong><span className="cap">Наступні</span></div>
         <div className="seg"><strong className={attention.length ? 'warn' : ''}>{attention.length}</strong><span className="cap">Увага</span></div>
@@ -461,9 +568,12 @@ function App() {
       </div>}
     </header>
     {state?.secretError && <div className="banner" role="alert">{state.secretError}</div>}
+    {state?.accountsError && <div className="banner" role="alert">{state.accountsError}</div>}
 
     <div id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden={tab !== 'tasks'}>
       <div className="workspace">
+        <div className="task-tools">
+        <BehaviorTest profiles={options} now={now} />
         <section className="composer" aria-labelledby="new-task"><h2 id="new-task">Нове завдання</h2>
           <form noValidate onSubmit={schedule}>
             <Field id="task-url" label="Посилання на монету" error={errors.url}>
@@ -493,6 +603,12 @@ function App() {
                 <button type="button" className="link" onClick={() => setTab('settings')}>Керувати</button>
               </div>
               {options.length > 0 && <div className="picker">
+                <label className="check check-select-all">
+                  <input type="checkbox" checked={profiles.length === options.length}
+                    ref={node => { if (node) node.indeterminate = profiles.length > 0 && profiles.length < options.length; }}
+                    onChange={event => setSelected(event.target.checked ? options.map(profile => profile.id) : [])} />
+                  <span>Вибрати всі</span>
+                </label>
                 {options.length > 6 && <input aria-label="Пошук профілів" placeholder="Пошук за назвою або ID" value={profileSearch}
                   onChange={(e) => setProfileSearch(e.target.value)} />}
                 <div className="checklist" role="group" aria-label="Профілі AdsPower">
@@ -516,6 +632,7 @@ function App() {
             </div>
           </form>
         </section>
+        </div>
 
         <section className="board" aria-labelledby="tasks-title">
           <h2 id="tasks-title">Черга завдань</h2>
@@ -531,12 +648,19 @@ function App() {
               confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask}
               batchSize={task.batchId ? tasks.filter((item) => item.batchId === task.batchId && item.status === 'scheduled').length : 1}
               onSave={updateTask} onReplan={replanTask} />)}</div>}
+          {sales.length > 0 && <div className="group"><h3 className="group-title">Підсумки продажів</h3>
+            <div className="history">{sales.map((sale, index) => <SaleSummaryView key={sale.saleAt} sale={sale} now={now} open={index === 0}
+              profileName={profileName} />)}</div></div>}
           {history.length > 0 && <div className="group"><h3 className="group-title">Завершені · {history.length}</h3>
             <div className="history">{shownHistory.map((task) => <HistoryRow key={task.id} task={task} now={now} profileName={profileName(task.profileId)} />)}</div>
             {history.length > HISTORY_PREVIEW && <button type="button" className="link" onClick={() => setShowAllHistory(!showAllHistory)}>
               {showAllHistory ? 'Показати менше' : `Показати всі ${history.length}`}</button>}</div>}
         </section>
       </div>
+    </div>
+
+    <div id="panel-cabinet" role="tabpanel" aria-labelledby="tab-cabinet" hidden={tab !== 'cabinet'}>
+      {state && <Cabinet key={state.settings.apiUrl} connection={state.settings.apiUrl} profiles={options} now={now} active={tab === 'cabinet'} />}
     </div>
 
     <div id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden={tab !== 'settings'}>
@@ -547,7 +671,10 @@ function App() {
               setProfileDrafts((current) => [...current, { id: '', name: '' }]);
             }}>Додати профіль</button></div>
           <div id="set-profiles" tabIndex={-1}>
-            {profileDrafts.map((profile, index) => <div className="profile-editor" key={index}>
+            {profileDrafts.map((profile, index) => {
+              const id = profile.id.trim();
+              const saved = !!id && options.some((item) => item.id === id);
+              return <div className="profile-editor" key={index}>
               <Field id={`profile-name-${index}`} label="Назва">
                 <input id={`profile-name-${index}`} placeholder="Назва для зручності" maxLength={80} value={profile.name}
                   onChange={(e) => setProfileDrafts((current) => current.map((row, i) => i === index ? { ...row, name: e.target.value } : row))} />
@@ -558,7 +685,11 @@ function App() {
               </Field>
               <button type="button" className="link danger-text" aria-label={`Видалити профіль ${profile.name || profile.id || index + 1}`}
                 onClick={() => setProfileDrafts((current) => current.filter((_, i) => i !== index))}>Видалити</button>
-            </div>)}
+              <NbuAccountToggle email={state?.nbuAccounts[id]} saved={saved} open={saved && accountOpen === id}
+                onToggle={() => setAccountOpen((current) => current === id ? '' : id)} />
+              {saved && accountOpen === id && <NbuAccountEditor profileId={id} email={state?.nbuAccounts[id]}
+                onClose={() => { setAccountOpen(''); void window.desktop.state().then(setState).catch(() => {}); }} />}
+            </div>; })}
             {!profileDrafts.length && <p className="hint">Додайте ID з AdsPower. Назву можна задати для зручності. API-ключ для цього не потрібен.</p>}
           </div>
           {settingsErrors.profiles && <p className="field-error" role="alert">{settingsErrors.profiles}</p>}
@@ -605,7 +736,7 @@ function App() {
               onChange={(e) => setNums({ ...nums, leadMin: e.target.value })} />
           </Field>
           <Field id="set-retrySec" label="Повторне оновлення, с" error={settingsErrors.retrySec}
-            hint="Якщо кнопки ще немає, сторінка оновиться не раніше ніж через цей інтервал. Мінімум 5 с.">
+            hint="Якщо кнопки ще немає, повторне оновлення — через цей інтервал після завантаження сторінки. Мінімум і початкове значення — 1 с.">
             <input id="set-retrySec" inputMode="numeric" value={nums.retrySec} aria-invalid={!!settingsErrors.retrySec}
               onChange={(e) => setNums({ ...nums, retrySec: e.target.value })} />
           </Field>

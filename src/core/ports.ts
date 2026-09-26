@@ -1,3 +1,5 @@
+import type { OffsetBounds } from './clock-bounds';
+
 export interface PageState {
   login: 'logged-in' | 'logged-out' | 'unknown';
   challenge: boolean;
@@ -7,6 +9,10 @@ export interface PageState {
   purchasePending: boolean;
   inCart: boolean;
   queuePosition: string;
+  buyUnavailableReason?: 'missing-form' | 'missing-product' | 'missing-button' | 'hidden-button' | 'disabled-button' | 'blocked-container' | 'limited' | 'pending';
+  cartConfirmation?: 'product-page' | 'visible-cart';
+  navigationHttpStatus?: number;
+  sharedRateLimit?: boolean;
 }
 
 export interface ShopSession {
@@ -16,13 +22,22 @@ export interface ShopSession {
   waitForActionable(timeoutMs: number): Promise<PageState>;
   reload(): Promise<void>;
   serverOffset(): Promise<number>;
+  serverOffsetBounds?(): Promise<OffsetBounds | undefined>;
+  // Signs in with the account saved for the profile and reloads the tab. False: no usable account.
+  login?(): Promise<boolean>;
+  // Development record of the page (HTML, text, the page's own XHR). Never called before the first click
+  // in the sale window: a page dump shares the CDP channel with the click.
+  capture?(request: CaptureRequest): Promise<void>;
   clickBuy(): Promise<void>;
   disconnect(): Promise<void>;
 }
 
+export interface CaptureRequest { label: string; saleDeltaMs: number; force?: boolean }
+
 export interface PreparationOptions {
   deadline: number;
   onRateLimit?: () => Promise<void>;
+  capture?: { taskId: string; saleAt: number };
 }
 
 export interface BrowserProvider {

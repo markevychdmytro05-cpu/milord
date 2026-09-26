@@ -5,6 +5,7 @@ import { expect, it, vi } from 'vitest';
 import { Scheduler } from '../src/main/scheduler';
 import { Store } from '../src/main/store';
 import { task } from './helpers';
+import type { PreparationOptions } from '../src/core/ports';
 
 async function setup() {
   const path = join(await mkdtemp(join(tmpdir(), 'nbu-scheduler-')), 'tasks.json');
@@ -12,6 +13,7 @@ async function setup() {
   const signals = new Map<string, AbortSignal>();
   const provider = { connect: vi.fn((id: string, _url: string, signal: AbortSignal) => {
     signals.set(id, signal);
+    signal.throwIfAborted();
     return new Promise<never>((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(Error('cancelled')), { once: true });
     });
@@ -136,13 +138,15 @@ it('shares pending preparation and cancelling one coin keeps the other connected
   const { ready } = await import('./helpers');
   let release!: () => void;
   let preparationSignal!: AbortSignal;
+  let preparationOptions: PreparationOptions | undefined;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const disconnect = vi.fn(async () => {});
   const pool = { disconnect, connect: vi.fn(async () => ({
     read: async () => ({ ...ready, inCart: true }), waitForActionable: async () => ready,
     reload: async () => {}, serverOffset: async () => 0, clickBuy: async () => {}, disconnect: async () => {},
   })) };
-  const provider = { connect: vi.fn(), prepare: vi.fn(async (_profile: string, _urls: string[], signal: AbortSignal) => {
+  const provider = { connect: vi.fn(), prepare: vi.fn(async (_profile: string, _urls: string[], signal: AbortSignal, options?: PreparationOptions) => {
+    preparationOptions = options;
     preparationSignal = signal; await gate; return pool;
   }) };
   const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
@@ -150,6 +154,8 @@ it('shares pending preparation and cancelling one coin keeps the other connected
     await scheduler.addMany(['one', 'two'].map((coin) => task({ saleAt: Date.now() + 60_000,
       url: `https://coins.bank.gov.ua/${coin}.html` })));
     await vi.waitFor(() => expect(provider.prepare).toHaveBeenCalledTimes(1));
+    await preparationOptions?.onRateLimit?.();
+    expect(store.tasks().every(item => item.events.some(event => event.message.includes('429')))).toBe(true);
     await scheduler.cancel(store.tasks()[0]!.id);
     expect(preparationSignal.aborted).toBe(false);
     expect(disconnect).not.toHaveBeenCalled();
@@ -180,4 +186,47 @@ it('aborts shared preparation when the last waiting coin is cancelled', async ()
     expect(preparationSignal.aborted).toBe(true);
     expect(store.tasks().map(t => t.status)).toEqual(['cancelled', 'cancelled']);
   } finally { await scheduler.stop(); }
+});
+
+it('reserves cabinet reads and refuses them near a sale or during active purchase work', async () => {
+  const { store, scheduler } = await setup();
+  const read = vi.fn(async () => 'cabinet');
+  await store.saveTask(task({ saleAt: Date.now() + 60_000 }));
+  await expect(scheduler.readProfile('abc123', read)).rejects.toThrow('зайнятий');
+  expect(read).not.toHaveBeenCalled();
+  await store.saveTask(task({ saleAt: Date.now() + 86_400_000 }));
+  await expect(scheduler.readProfile('abc123', read)).resolves.toBe('cabinet');
+  let started!: () => void;
+  const ready = new Promise<void>(resolve => { started = resolve; });
+  const pending = scheduler.readProfile('abc123', signal => new Promise<never>((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(Error('cancelled')), { once: true }); started();
+  }));
+  const result = expect(pending).rejects.toThrow('cancelled');
+  await ready;
+  await expect(scheduler.readProfile('abc123', read)).rejects.toThrow('зайнятий');
+  expect(scheduler.hasRunningWork()).toBe(true);
+  await scheduler.stop(); await result;
+  expect(scheduler.hasRunningWork()).toBe(false);
+});
+
+it('interrupts a long profile test when a previously scheduled purchase reaches preparation time', async () => {
+  vi.useFakeTimers();
+  const { scheduler, provider } = await setup();
+  try {
+    const start = Date.now();
+    await scheduler.add(task({ profileId: 'a', saleAt: start + 300_000, leadMin: 1 }));
+    scheduler.start();
+    let testSignal!: AbortSignal;
+    const test = scheduler.readProfile('a', signal => new Promise<string>(resolve => {
+      testSignal = signal;
+      signal.addEventListener('abort', () => resolve('stopped'), { once: true });
+    }), 600_000);
+    await Promise.resolve();
+    vi.setSystemTime(start + 180_000); await vi.advanceTimersByTimeAsync(500);
+    expect(testSignal.aborted).toBe(false);
+    expect(provider.connect).not.toHaveBeenCalled();
+    vi.setSystemTime(start + 240_000); await vi.advanceTimersByTimeAsync(1000);
+    expect(await test).toBe('stopped');
+    await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledOnce());
+  } finally { await scheduler.stop(); vi.useRealTimers(); }
 });

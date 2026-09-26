@@ -1,4 +1,8 @@
+import type { BehaviorTestResult } from './pointer-motion';
+import type { CabinetSavedState } from './cabinet-state';
 import { z } from 'zod';
+import type { CabinetSection, CabinetSnapshot, CabinetOrderDetails, CabinetOrdersPage } from './cabinet';
+import type { OffsetHistorySummary } from './offset-history';
 
 export function productUrl(value: string): string {
   const url = new URL(value);
@@ -18,7 +22,7 @@ export const taskInputSchema = z.object({
   profileId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
   saleAt: z.number().int().positive().max(8_640_000_000_000_000),
   leadMin: z.number().int().min(1).max(60).default(5),
-  retrySec: z.number().int().min(1).max(60).default(5),
+  retrySec: z.number().int().min(1).max(60).default(1),
   windowMin: z.number().int().min(1).max(30).default(5),
   mode: z.enum(['observe', 'cart']).default('observe'),
 });
@@ -44,8 +48,21 @@ export const taskSchema = taskInputSchema.extend({
   clicks: z.number().int().nonnegative(),
   reloads: z.number().int().nonnegative(),
   offsetMs: z.number().finite(),
+  offsetSampledAt: z.number().optional(),
+  // Range of (server − local) proven by the measured responses; see core/clock-bounds.ts.
+  offsetLowMs: z.number().finite().optional(),
+  offsetHighMs: z.number().finite().optional(),
+  // Sale timings in ms relative to the sale start by the server clock; the journal may be trimmed.
+  startLoadedMs: z.number().finite().optional(),
+  buttonSeenMs: z.number().finite().optional(),
+  buttonReloads: z.number().int().nonnegative().optional(),
+  firstClickMs: z.number().finite().optional(),
+  cartMs: z.number().finite().optional(),
   note: z.string(),
-  events: z.array(z.object({ at: z.number(), message: z.string() })).max(200),
+  events: z.array(z.object({
+    at: z.number(), message: z.string(),
+    details: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+  })).max(200),
 });
 export type Task = z.infer<typeof taskSchema>;
 
@@ -72,7 +89,7 @@ export const settingsSchema = z.object({
     'ID профілів не мають повторюватися.',
   ).default([]),
   leadMin: z.number().int().min(1).max(60).default(5),
-  retrySec: z.number().int().min(5).max(60).default(5),
+  retrySec: z.number().int().min(1).max(60).default(1),
   windowMin: z.number().int().min(1).max(30).default(5),
 });
 export type Settings = z.infer<typeof settingsSchema>;
@@ -85,11 +102,25 @@ export interface AppState {
   savedApiKey: boolean;
   secretStorageAvailable: boolean;
   secretError?: string;
+  // Profile ID → e-mail of the saved NBU account. Passwords never reach the window.
+  nbuAccounts: Record<string, string>;
+  accountsError?: string;
+  offsetHistoryByProfile: Record<string, OffsetHistorySummary>;
 }
 
 export interface AdsProfile { id: string; name: string; number: string; }
 
 export interface DesktopApi {
+  testBehavior(input: { profileId: string; navigate: boolean; minutes: number }): Promise<BehaviorTestResult>;
+  stopBehaviorTest(profileId: string): Promise<void>;
+  restoreCabinet(input: { connection: string; legacy?: string }): Promise<CabinetSavedState>;
+  saveCabinet(input: { connection: string; state: CabinetSavedState }): Promise<void>;
+  loadCabinetOrders(input: { profileId: string; page: number }): Promise<CabinetOrdersPage>;
+  openCaptures(): Promise<void>;
+  saveNbuAccount(input: { profileId: string; email: string; password: string }): Promise<void>;
+  clearNbuAccount(profileId: string): Promise<void>;
+  loadCabinet(profileId: string, sections?: CabinetSection[]): Promise<CabinetSnapshot>;
+  loadCabinetOrder(input: { profileId: string; orderId: string; detailId?: string }): Promise<CabinetOrderDetails>;
   state(): Promise<AppState>;
   saveSettings(input: Settings & { apiKey?: string }): Promise<void>;
   clearApiKey(): Promise<void>;

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { runTask } from '../core/buyer';
+import { priorOffsetBounds } from '../core/clock-bounds';
 import { isFinal, productUrl, taskInputSchema, type Task, type TaskInput } from '../core/model';
 import { realClock, type BrowserProvider, type PreparedProfile } from '../core/ports';
 import { UserFacingError } from '../core/shop-errors';
@@ -13,8 +14,10 @@ export function tasksOverlap(a: TaskInput, b: TaskInput): boolean {
 
 export class Scheduler {
   private running = new Map<string, { controller: AbortController; done: Promise<void>; profileId: string; batchId?: string }>();
-  private prepared = new Map<string, { controller: AbortController; promise: Promise<PreparedProfile> }>();
+  private prepared = new Map<string, { controller: AbortController; promise: Promise<PreparedProfile>;
+    rateLimitListeners: Set<() => Promise<void>> }>();
   private inspecting = new Set<string>();
+  private profileReads = new Map<string, { controller: AbortController; done: Promise<unknown> }>();
   private timer?: ReturnType<typeof setInterval>;
   private mutations: Promise<unknown> = Promise.resolve();
   private stopped = false;
@@ -64,7 +67,8 @@ export class Scheduler {
         positions.set(input.profileId, batchIndex + 1);
         return {
           ...input, id: randomUUID(), batchId, batchIndex, status: 'scheduled', createdAt: Date.now(), updatedAt: Date.now(),
-          clicks: 0, reloads: 0, offsetMs: 0, note: 'Завдання заплановано. Монети запускаються незалежно.', events: [],
+          clicks: 0, reloads: 0, offsetMs: 0, note: 'Завдання заплановано. Монети запускаються незалежно.',
+          events: [{ at: Date.now(), message: 'Завдання заплановано. Монети запускаються незалежно.' }],
         };
       });
       await this.store.addTasks(tasks);
@@ -126,6 +130,7 @@ export class Scheduler {
         task.status = 'cancelled';
         task.note = 'Завдання скасовано до запуску.';
         task.updatedAt = Date.now();
+        task.events = [...task.events, { at: task.updatedAt, message: task.note }].slice(-200);
         await this.store.saveTask(task);
         this.onTask(task);
       }
@@ -158,18 +163,43 @@ export class Scheduler {
     }
   }
 
+  readProfile<T>(profileId: string, action: (signal: AbortSignal) => Promise<T>, timeoutMs = 90_000): Promise<T> {
+    if (this.stopped || this.inspecting.has(profileId) || this.store.tasks().some(task => task.profileId === profileId &&
+      !isFinal(task.status) && (task.status !== 'scheduled' || task.saleAt - task.leadMin * 60_000 <= Date.now() + 120_000))) {
+      return Promise.reject(new UserFacingError('Профіль зайнятий або скоро почне підготовку до покупки. Повторіть після завершення.'));
+    }
+    this.inspecting.add(profileId);
+    const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
+    this.onBusy(true);
+    const done = Promise.resolve().then(() => action(signal)).finally(() => {
+      this.profileReads.delete(profileId);
+      this.inspecting.delete(profileId);
+      this.onBusy(this.hasActiveWork());
+    });
+    this.profileReads.set(profileId, { controller, done });
+    return done;
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     clearInterval(this.timer);
+    for (const read of this.profileReads.values()) read.controller.abort();
     for (const entry of this.prepared.values()) entry.controller.abort();
     for (const active of this.running.values()) active.controller.abort();
     await Promise.all([...this.running.values()].map((active) => active.done));
+    await Promise.allSettled([...this.profileReads.values()].map(read => read.done));
     await Promise.all([...this.prepared.values()].map((entry) => entry.promise.then((pool) => pool.disconnect()).catch(() => {})));
     this.prepared.clear();
   }
 
   private tick(): void {
     if (this.stopped) return;
+    for (const task of this.store.tasks()) {
+      if (task.status === 'scheduled' && task.saleAt - task.leadMin * 60_000 <= Date.now()) {
+        this.profileReads.get(task.profileId)?.controller.abort();
+      }
+    }
     for (const task of this.store.tasks()) {
       if (task.status !== 'scheduled' || this.running.has(task.id) || this.inspecting.has(task.profileId) ||
           Date.now() < task.saleAt - task.leadMin * 60_000 ||
@@ -190,22 +220,28 @@ export class Scheduler {
               // Preparation belongs to the group, not its first task. Cancelling one coin must
               // not cancel another coin's navigation or disconnect its browser session.
               const preparationController = new AbortController();
+              const rateLimitListeners = new Set<() => Promise<void>>();
               const promise = Promise.resolve().then(() => provider.prepare!(profileId,
                 remaining.map((item) => item.url), preparationController.signal, {
                   deadline: Math.max(...remaining.map((item) => item.saleAt + item.windowMin * 60_000)),
+                  onRateLimit: async () => { await Promise.all([...rateLimitListeners].map((listener) => listener())); },
                 }));
-              entry = { controller: preparationController, promise };
+              entry = { controller: preparationController, promise, rateLimitListeners };
               this.prepared.set(key, entry);
             }
-            const pool = await this.waitForPool(entry.promise, signal);
-            signal.throwIfAborted();
-            return pool.connect(profileId, url, signal, options);
+            const listener = async () => { if (!signal.aborted) await options?.onRateLimit?.(); };
+            entry.rateLimitListeners.add(listener);
+            try {
+              const pool = await this.waitForPool(entry.promise, signal);
+              signal.throwIfAborted();
+              return await pool.connect(profileId, url, signal, options);
+            } finally { entry.rateLimitListeners.delete(listener); }
           },
         };
         await runTask(task, pooled, realClock, controller.signal, async (next) => {
           await this.store.saveTask(next);
           this.onTask(next);
-        });
+        }, () => priorOffsetBounds(this.store.tasks(), task.profileId, Date.now(), task.id));
       }).catch(() => {
         // Stop all scheduling on a persistence failure: a click must not happen without its journal entry.
         clearInterval(this.timer);

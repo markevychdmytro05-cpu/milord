@@ -42,6 +42,7 @@ export class ShopRequestGuard {
     this.pending = true;
   }
   isBlocked(): boolean { return this.pending; }
+  canRetryNow(): boolean { return !this.pending || this.clock.now() >= this.until; }
   check(): void { if (this.pending) throw new ShopRateLimitError(); }
   async wait(signal: AbortSignal, deadline: number): Promise<void> {
     while (this.clock.now() < this.until) {

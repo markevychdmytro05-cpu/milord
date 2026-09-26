@@ -51,6 +51,14 @@ export function readNbuPage(click = false): PageState {
     inCart: !!document.querySelector('#r_buy_intovar .added2cart, #r_buy_intovar a[href*="shopping_cart"]'),
     queuePosition: document.querySelector('#cart-queue-position')?.textContent?.trim() || '',
   };
+  if (!state.buyAvailable) {
+    state.buyUnavailableReason = !form ? 'missing-form'
+      : !form.querySelector('[name="products_id"]') ? 'missing-product'
+      : !button ? 'missing-button' : purchasePending ? 'pending'
+      : button.classList.contains('limited') ? 'limited'
+      : button.disabled ? 'disabled-button' : !visible ? 'hidden-button' : 'blocked-container';
+  }
+  if (state.inCart) state.cartConfirmation = 'product-page';
   if (click) {
     if (!state.buyAvailable || state.login !== 'logged-in' || state.inCart ||
         state.rateLimited || state.challenge || state.turnstile || state.purchasePending || state.queuePosition || !button) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runTask, CLICK_COOLDOWN_MS, MAX_CLICKS } from '../src/core/buyer';
+import { runTask, reloadIntervalMs, CLICK_COOLDOWN_MS, MAX_CLICKS } from '../src/core/buyer';
 import { fakeBrowser, FakeClock, ready, task } from './helpers';
 
 describe('purchase workflow', () => {
@@ -151,15 +151,21 @@ describe('purchase workflow', () => {
     expect(browser.reloads).toHaveLength(1);
   });
 
-  it('does not refresh before the sale or use a one-second network burst afterwards', async () => {
+  it('refreshes fast while the sale opens, then backs off after each completed load', async () => {
     const clock = new FakeClock();
     const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: false }));
-    await runTask(task({ saleAt: 1_010_000, retrySec: 1 }), browser.provider, clock,
+    const reload = browser.session.reload;
+    browser.session.reload = async () => { await reload(); clock.time += 250; };
+    await runTask(task({ saleAt: 1_010_000, retrySec: 1, windowMin: 5 }), browser.provider, clock,
       new AbortController().signal, async () => {});
     expect(browser.reloads[0]).toBe(1_010_000);
     for (let i = 1; i < browser.reloads.length; i++) {
-      expect(browser.reloads[i]! - browser.reloads[i - 1]!).toBeGreaterThanOrEqual(5000);
+      const loadedAt = browser.reloads[i - 1]! + 250;
+      expect(browser.reloads[i]! - loadedAt).toBe(reloadIntervalMs(loadedAt - 1_010_000, 1));
     }
+    expect(browser.reloads.slice(0, 3)).toEqual([1_010_000, 1_010_950, 1_011_900]);
+    // The old fixed 1 s cadence made ~240 full reloads here.
+    expect(browser.reloads.length).toBeLessThan(60);
   });
 
   it('expires without clicking if the machine wakes after the sale window', async () => {
@@ -374,4 +380,19 @@ it('recovers when another tab reports 429 between persisted intent and the actua
   const input = task();
   await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
   expect(input.status).toBe('in_cart'); expect(input.clicks).toBe(1); expect(browser.clicks).toHaveLength(1);
+});
+
+describe('reload interval', () => {
+  it('uses 700 ms for the first five seconds, then backs off', () => {
+    expect([0, 4_999, 5_000, 19_999, 20_000, 59_999, 60_000, 119_999, 120_000, 299_000]
+      .map((elapsed) => reloadIntervalMs(elapsed, 1)))
+      .toEqual([700, 700, 1000, 1000, 3000, 3000, 5000, 5000, 10_000, 10_000]);
+  });
+
+  it('never shortens a slower interval the user chose', () => {
+    expect(reloadIntervalMs(0, 5)).toBe(5000);
+    expect(reloadIntervalMs(30_000, 5)).toBe(5000);
+    expect(reloadIntervalMs(200_000, 5)).toBe(10_000);
+    expect(reloadIntervalMs(200_000, 30)).toBe(30_000);
+  });
 });

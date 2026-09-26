@@ -46,7 +46,7 @@ it('migrates old settings and retains a batch during concurrent task updates', a
   const path = await storePath();
   await writeFile(path, JSON.stringify({ version: 1, settings: { apiUrl: 'http://localhost:50325' }, tasks: [] }));
   const store = new Store(path); await store.load();
-  expect(store.settings()).toMatchObject({ defaultProfileIds: [], leadMin: 5, retrySec: 5 });
+  expect(store.settings()).toMatchObject({ defaultProfileIds: [], leadMin: 5, retrySec: 1 });
   await store.saveTask(task());
   await Promise.all([
     store.addTasks([task({ id: 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa', profileId: 'other' })]),
@@ -75,4 +75,28 @@ it('rejects duplicate profile IDs without changing previously saved settings', a
   await store.saveSettings({ ...store.settings(), savedProfiles: [{ id: 'p7', name: 'Основний' }] });
   await expect(store.saveSettings({ ...store.settings(), savedProfiles: [{ id: 'p7', name: 'A' }, { id: ' p7 ', name: 'B' }] })).rejects.toThrow();
   expect(store.settings().savedProfiles).toEqual([{ id: 'p7', name: 'Основний' }]);
+});
+
+it('migrates the old five-second interval once for settings and scheduled tasks only', async () => {
+  const path = await storePath();
+  await writeFile(path, JSON.stringify({ version: 1, settings: { apiUrl: 'http://localhost:50325', retrySec: 5 },
+    tasks: [task(), task({ id: 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa', status: 'in_cart', updatedAt: Date.now() }),
+      task({ id: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb', retrySec: 7 })] }));
+  const store = new Store(path); await store.load();
+  expect(store.settings().retrySec).toBe(1);
+  expect(store.tasks().map(item => item.retrySec)).toEqual([1, 5, 7]);
+  expect(store.tasks()[0]?.events.at(-1)?.message).toContain('з 5 до 1 с');
+  // An explicit choice of five seconds after migration must survive future restarts.
+  await store.saveSettings({ ...store.settings(), retrySec: 5 });
+  await store.saveTask({ ...store.tasks()[0]!, retrySec: 5 });
+  const reopened = new Store(path); await reopened.load();
+  expect(reopened.settings().retrySec).toBe(5);
+  expect(reopened.tasks()[0]?.retrySec).toBe(5);
+});
+
+it('preserves a custom interval during migration', async () => {
+  const path = await storePath();
+  await writeFile(path, JSON.stringify({ version: 1, settings: { apiUrl: 'http://localhost:50325', retrySec: 7 }, tasks: [] }));
+  const store = new Store(path); await store.load();
+  expect(store.settings().retrySec).toBe(7);
 });

@@ -2,6 +2,16 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { DesktopApi } from '../core/model';
 
 const api: DesktopApi = {
+  testBehavior: input => ipcRenderer.invoke('test-behavior', input),
+  stopBehaviorTest: profileId => ipcRenderer.invoke('stop-behavior-test', profileId),
+  restoreCabinet: (input) => ipcRenderer.invoke('restore-cabinet', input),
+  saveCabinet: (input) => ipcRenderer.invoke('save-cabinet', input),
+  loadCabinetOrders: (input) => ipcRenderer.invoke('load-cabinet-orders', input),
+  openCaptures: () => ipcRenderer.invoke('open-captures'),
+  saveNbuAccount: (input) => ipcRenderer.invoke('save-nbu-account', input),
+  clearNbuAccount: (profileId) => ipcRenderer.invoke('clear-nbu-account', profileId),
+  loadCabinet: (profileId, sections) => ipcRenderer.invoke('load-cabinet', { profileId, sections }),
+  loadCabinetOrder: (input) => ipcRenderer.invoke('load-cabinet-order', input),
   state: () => ipcRenderer.invoke('state'),
   saveSettings: (input) => ipcRenderer.invoke('save-settings', input),
   clearApiKey: () => ipcRenderer.invoke('clear-api-key'),

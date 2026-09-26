@@ -121,7 +121,7 @@ it('recognizes the selected product in another prepared tab cart without a new r
     pages[0]!.setCartIds(['1126']);
     expect((await session.read()).inCart).toBe(false);
     pages[0]!.setCartIds(['1126', '885']);
-    expect((await session.read()).inCart).toBe(true);
+    expect(await session.read()).toMatchObject({ inCart: true, cartConfirmation: 'visible-cart' });
     expect(requests).toHaveLength(0);
   } finally { await pool.disconnect(); }
 });
@@ -166,5 +166,18 @@ it('does not let a stale 429 page in an unrelated tab pause the bot or reload th
   expect(guard.isBlocked()).toBe(false);
   expect(pages[0]!.reload).not.toHaveBeenCalled();
   expect(requests.map((request) => request.url)).toEqual([one]);
+  await pool.disconnect();
+});
+
+it('derives a clock range from the navigation response that contains the true offset', async () => {
+  const { provider } = fixture();
+  const signal = new AbortController().signal;
+  const pool = await provider.prepare('abc', [one], signal);
+  const session = await pool.connect('abc', one, signal);
+  const bounds = (await session.serverOffsetBounds!())!;
+  // The fixture's server clock equals the local clock, stamped at request time.
+  expect(bounds.lowMs).toBeLessThanOrEqual(0);
+  expect(bounds.highMs).toBeGreaterThanOrEqual(0);
+  expect(bounds.highMs - bounds.lowMs).toBeLessThan(1100);
   await pool.disconnect();
 });
