@@ -8,3 +8,6 @@ release/
 .DS_Store
 coverage/
 .local-data/
+
+# Markdown notes and docs stay local
+*.md
