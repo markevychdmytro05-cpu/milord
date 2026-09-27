@@ -19,6 +19,7 @@ import { cabinetDocumentSchema } from '../core/cabinet-state';
 import { AccountStore, nbuCredentialsSchema } from './account-store';
 import { NbuLogin } from '../browser/nbu-login';
 import { PageRecorder } from '../browser/page-recorder';
+import { launchAdsPower } from './adspower-launcher';
 
 app.setName('NBU Desktop');
 // UI smoke tests use an isolated temporary directory, never the user's task history.
@@ -90,7 +91,7 @@ async function boot(): Promise<void> {
   const recorder = new PageRecorder(capturesPath);
   void recorder.prune();
   scheduler = new Scheduler(store,
-    () => new AdsPowerProvider(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate), shopGuard, preparationGate, nbuLogin, recorder),
+    () => new AdsPowerProvider(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, recorder),
     notify, busy,
     (message) => dialog.showErrorBox('Планувальник зупинено', message),
   );
@@ -165,20 +166,20 @@ async function boot(): Promise<void> {
   const cabinetProfile = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
   const behaviorTests = new BehaviorTests();
   handle('test-behavior', input => {
-    const { profileId, navigate, minutes } = z.object({ profileId: cabinetProfile, navigate: z.boolean(),
-      minutes: z.number().int().min(1).max(60) }).parse(input);
+    const { profileId, navigate, showCursor, minutes } = z.object({ profileId: cabinetProfile, navigate: z.boolean(),
+      showCursor: z.boolean().default(false), minutes: z.number().int().min(1).max(60) }).parse(input);
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
     return behaviorTests.run(profileId, cancel => scheduler.readProfile(profileId, signal => new BehaviorTester(
-      new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate), shopGuard, preparationGate,
-    ).run(profileId, navigate, AbortSignal.any([signal, cancel]), minutes * 60_000), minutes * 60_000 + 30_000));
+      new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, undefined, undefined, nbuLogin,
+    ).run(profileId, { navigate, showCursor, durationMs: minutes * 60_000 }, AbortSignal.any([signal, cancel])), minutes * 60_000 + 240_000));
   });
   handle('stop-behavior-test', input => { behaviorTests.stop(cabinetProfile.parse(input)); });
-  function cabinetRequest<T>(profileId: string, key: string, read: (reader: CabinetReader, signal: AbortSignal) => Promise<T>): Promise<T> {
+  function cabinetRequest<T>(profileId: string, key: string, read: (reader: CabinetReader, signal: AbortSignal) => Promise<T>, openProfile = true): Promise<T> {
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
-    return cabinetCache.get(JSON.stringify([profileId, key]), () => scheduler.readProfile(profileId, signal => {
-      const reader = new CabinetReader(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate), shopGuard, preparationGate, nbuLogin);
+    return cabinetCache.get(JSON.stringify([profileId, key, openProfile]), () => scheduler.readProfile(profileId, signal => {
+      const reader = new CabinetReader(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, openProfile);
       return read(reader, signal);
-    })).catch(error => { throw new Error(cabinetError(error)); });
+    }, openProfile ? 240_000 : 90_000)).catch(error => { throw new Error(cabinetError(error)); });
   }
   handle('open-captures', async () => {
     await mkdir(capturesPath, { recursive: true, mode: 0o700 });
@@ -200,9 +201,9 @@ async function boot(): Promise<void> {
   });
   handle('clear-nbu-account', async input => { await accountStore.clear(cabinetProfile.parse(input)); });
   handle('load-cabinet', input => {
-    const { profileId, sections } = z.object({ profileId: cabinetProfile,
+    const { profileId, sections, openProfile } = z.object({ profileId: cabinetProfile, openProfile: z.boolean().default(false),
       sections: z.array(z.enum(['orders', 'wishlist', 'cart'])).min(1).max(3).optional() }).parse(input);
-    return cabinetRequest(profileId, `snapshot:${(sections ?? ['all']).join(',')}`, (reader, signal) => reader.load(profileId, signal, sections));
+    return cabinetRequest(profileId, `snapshot:${(sections ?? ['all']).join(',')}`, (reader, signal) => reader.load(profileId, signal, sections), openProfile);
   });
   handle('load-cabinet-order', input => {
     const { profileId, orderId, detailId } = z.object({ profileId: cabinetProfile, orderId: z.string().regex(/^\d{1,20}$/),

@@ -1,7 +1,7 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readNbuPage, assertShopPage, waitForActionablePage } from '../src/browser/nbu-page';
-import type { Page } from 'playwright-core';
+import { readNbuPage, assertShopPage, waitForActionablePage, clickBuyButton } from '../src/browser/nbu-page';
+import type { CDPSession, Page } from 'patchright-core';
 
 let dom: JSDOM | undefined;
 function page(markup = '') {
@@ -146,4 +146,45 @@ it('confirms exact product IDs and quantities in the visible, unexpired cart onl
   expect(readVisibleCartProductIds()).toEqual(['1126', '885']);
   rects.mockReturnValue([] as unknown as DOMRectList);
   expect(readVisibleCartProductIds()).toEqual([]);
+});
+
+describe('clickBuyButton', () => {
+  const preview = (fields: Record<string, string>) => ({ result: { objectId: 'probe',
+    preview: { properties: Object.entries(fields).map(([name, value]) => ({ name, value })) } } });
+  const fake = (aim: Record<string, string>, trusted: boolean) => {
+    const sent: Array<[string, Record<string, unknown>]> = [];
+    const cdp = { send: vi.fn(async (method: string, params: Record<string, unknown>) => {
+      sent.push([method, params]);
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'main' } } };
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 7 };
+      if (method === 'Runtime.evaluate') return preview(aim);
+      if (method === 'Runtime.callFunctionOn') return { result: { value: trusted } };
+      return {};
+    }) };
+    const page = { evaluate: vi.fn(async () => ({})) };
+    return { cdp: cdp as unknown as CDPSession, page: page as unknown as Page, sent, evaluate: page.evaluate };
+  };
+  it('presses the real mouse on the button and skips the DOM click when the page saw it', async () => {
+    const { cdp, page, sent, evaluate } = fake({ ready: 'true', aimed: 'true', x: '120.5', y: '40' }, true);
+    expect(await clickBuyButton(cdp, page)).toBe('mouse');
+    expect(sent.filter(([method]) => method === 'Input.dispatchMouseEvent').map(([, params]) => params.type))
+      .toEqual(['mouseMoved', 'mousePressed', 'mouseReleased']);
+    expect(sent.find(([, params]) => params?.type === 'mousePressed')?.[1]).toMatchObject({ x: 120.5, y: 40, button: 'left' });
+    expect(evaluate).not.toHaveBeenCalled();
+    // Aiming runs in our own isolated world, never in the site's.
+    expect(sent.find(([method]) => method === 'Runtime.evaluate')?.[1]).toMatchObject({ contextId: 7 });
+  });
+  it('falls back to the DOM click when the button is covered or the mouse missed', async () => {
+    for (const [aim, trusted] of [[{ ready: 'true', aimed: 'false' }, false], [{ ready: 'true', aimed: 'true', x: '1', y: '1' }, false]] as const) {
+      const { cdp, page, evaluate } = fake(aim, trusted);
+      expect(await clickBuyButton(cdp, page)).toBe('dom');
+      expect(evaluate).toHaveBeenCalledOnce();
+    }
+  });
+  it('does not click at all when the page is no longer ready', async () => {
+    const { cdp, page, sent, evaluate } = fake({ ready: 'false' }, false);
+    await expect(clickBuyButton(cdp, page)).rejects.toThrow('Page state changed before purchase click');
+    expect(sent.some(([method]) => method === 'Input.dispatchMouseEvent')).toBe(false);
+    expect(evaluate).not.toHaveBeenCalled();
+  });
 });

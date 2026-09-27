@@ -6,6 +6,7 @@ export interface CabinetProduct {
   price: number | null;
   total: number | null;
   url?: string;
+  imageUrl?: string;
   reservedUntil?: string;
 }
 export interface CabinetOrder {

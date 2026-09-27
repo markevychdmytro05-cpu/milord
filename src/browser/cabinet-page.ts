@@ -29,6 +29,19 @@ export function readCabinetPage(input: { section: CabinetSection | 'detail'; htm
   const pathOf = (a: HTMLAnchorElement) => {
     try { return new URL(a.getAttribute('href')!, 'https://coins.bank.gov.ua/'); } catch { return undefined; }
   };
+  const imageOf = (row: Element): string | undefined => {
+    for (const image of row.querySelectorAll('img')) {
+      for (const attribute of ['data-src', 'data-original', 'src']) {
+        const source = image.getAttribute(attribute)?.trim();
+        if (!source) continue;
+        try {
+          const url = new URL(source, 'https://coins.bank.gov.ua/');
+          if (['https://coins.bank.gov.ua', 'https://cdn-nbu.solomono.net'].includes(url.origin) && !url.username && !url.password) return url.href;
+        } catch { /* Ignore malformed image URLs. */ }
+      }
+    }
+    return undefined;
+  };
   const title = text(doc.querySelector('title'));
   if (/429|too many requests/i.test(title) || [...doc.querySelectorAll('h1,h2')].some(h => /\b429\b|too many requests/i.test(text(h)))) return { error: 'rate-limit' };
   if (doc.querySelector('script[src*=".bunny-shield"], .cf-turnstile:not(.success)') || /Establishing a secure connection/i.test(title)) return { error: 'challenge' };
@@ -102,6 +115,7 @@ export function readCabinetPage(input: { section: CabinetSection | 'detail'; htm
       const count = quantity(row.querySelector<HTMLSelectElement>('[name="cart_quantity[]"]')?.value ?? '');
       return { id, name: text(link), quantity: count, price: price(text(row.querySelector('.product_price'))),
         total: price(text(row.querySelector('.product_total'))), url: link ? pathOf(link)?.href : undefined,
+        imageUrl: imageOf(row),
         reservedUntil: row.querySelector('.cart-item-timer')?.getAttribute('data-expired') ?? undefined };
     });
     return products.some(p => !p.id || !p.name || p.quantity === null) ? { error: 'unrecognized' } : { products };
@@ -116,16 +130,18 @@ export function readCabinetPage(input: { section: CabinetSection | 'detail'; htm
     const id = url.pathname.match(/\/p-(\d+)\.html$/)?.[1] ?? url.searchParams.get('products_id');
     if (!id || !/^\d+$/.test(id) || !text(link)) continue;
     // Wishlist templates vary; product links identify rows without depending on button text.
-    let row: Element = link;
-    while (row.parentElement && row.parentElement !== wishlist) {
+    const tableRow = link.closest('#wishlist_table tbody tr');
+    let row: Element = tableRow ?? link;
+    while (!tableRow && row.parentElement && row.parentElement !== wishlist) {
       const ids = new Set([...row.parentElement.querySelectorAll<HTMLAnchorElement>('a[href]')].map(a => {
         const u = pathOf(a); return u?.pathname.match(/\/p-(\d+)\.html$/)?.[1] ?? u?.searchParams.get('products_id');
       }).filter(Boolean));
       if (ids.size > 1) break;
       row = row.parentElement;
     }
-    const amount = price(text(row.querySelector('.new_price, .product_price, .price, .price_value, .wishlist-price')));
-    products.set(id, { id, name: text(link), quantity: 1, price: amount, total: amount, url: url.href });
+    const amount = price(text(row.querySelector('.new_price, .product_price, .price, .price_value, .wishlist-price')
+      ?? tableRow?.children[2]));
+    products.set(id, { id, name: text(link), quantity: 1, price: amount, total: amount, url: url.href, imageUrl: imageOf(row) });
   }
   return products.size ? { products: [...products.values()] } : { error: 'unrecognized' };
 }

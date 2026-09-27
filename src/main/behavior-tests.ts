@@ -7,7 +7,7 @@ export class BehaviorTests {
   private purchases = 0;
   run(profileId: string, action: (signal: AbortSignal) => Promise<BehaviorTestResult>): Promise<BehaviorTestResult> {
     if (this.purchases) return Promise.reject(new Error('Створюється завдання покупки. Дочекайтеся завершення.'));
-    if (this.entries.has(profileId)) return Promise.reject(new Error('Тест цього профілю вже виконується.'));
+    if (this.entries.has(profileId)) return Promise.reject(new Error('Прогрів цього профілю вже виконується.'));
     const controller = new AbortController();
     const done = Promise.resolve().then(() => action(controller.signal)).finally(() => { this.entries.delete(profileId); });
     this.entries.set(profileId, { controller, done });

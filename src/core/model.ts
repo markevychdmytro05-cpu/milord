@@ -111,7 +111,7 @@ export interface AppState {
 export interface AdsProfile { id: string; name: string; number: string; }
 
 export interface DesktopApi {
-  testBehavior(input: { profileId: string; navigate: boolean; minutes: number }): Promise<BehaviorTestResult>;
+  testBehavior(input: { profileId: string; navigate: boolean; showCursor: boolean; minutes: number }): Promise<BehaviorTestResult>;
   stopBehaviorTest(profileId: string): Promise<void>;
   restoreCabinet(input: { connection: string; legacy?: string }): Promise<CabinetSavedState>;
   saveCabinet(input: { connection: string; state: CabinetSavedState }): Promise<void>;
@@ -119,7 +119,7 @@ export interface DesktopApi {
   openCaptures(): Promise<void>;
   saveNbuAccount(input: { profileId: string; email: string; password: string }): Promise<void>;
   clearNbuAccount(profileId: string): Promise<void>;
-  loadCabinet(profileId: string, sections?: CabinetSection[]): Promise<CabinetSnapshot>;
+  loadCabinet(profileId: string, sections?: CabinetSection[], openProfile?: boolean): Promise<CabinetSnapshot>;
   loadCabinetOrder(input: { profileId: string; orderId: string; detailId?: string }): Promise<CabinetOrderDetails>;
   state(): Promise<AppState>;
   saveSettings(input: Settings & { apiKey?: string }): Promise<void>;

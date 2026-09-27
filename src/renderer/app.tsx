@@ -4,7 +4,7 @@ import { isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type 
 import { kyivDateTimeInput, nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
 import '@fontsource-variable/inter/index.css';
 import './style.css';
-import { summarizeSales, type SaleSummary } from '../core/sale-summary';
+import { summarizeSales } from '../core/sale-summary';
 import { Cabinet } from './cabinet';
 import { NbuAccountEditor, NbuAccountToggle } from './nbu-account';
 import { BehaviorTest } from './behavior-test';
@@ -95,11 +95,6 @@ function Icon({ name, size = 18 }: { name: keyof typeof ICONS; size?: number }) 
   return <svg className="icon" viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.8"
     strokeLinecap="square" strokeLinejoin="miter" aria-hidden="true">{ICONS[name]}</svg>;
 }
-function StatTile({ icon, label, value }: { icon: keyof typeof ICONS; label: string; value: number }) {
-  return <div className="stat"><span className="stat-icon"><Icon name={icon} /></span>
-    <span className="stat-text"><span className="cap">{label}</span><strong>{value}</strong></span></div>;
-}
-
 interface CardProps {
   task: Task; now: number; profileName: string; confirming: boolean; busy: boolean; batchSize: number;
   onAsk: (id: string | null) => void; onStop: (id: string) => void;
@@ -236,12 +231,13 @@ function HistoryRow({ task, now, profileName }: { task: Task; now: number; profi
   return <details className={`hist ${tone}`}>
     <summary>
       <span className="hist-line"><span className={`pill ${tone}`}>{labels[task.status]}</span>
-        <span className="hist-title">{coinTitle(task.url)}</span><span className="hist-when">{when(task.saleAt, now)}</span></span>
-      {task.note && <span className="hist-note">{task.note}</span>}
+        <span className="hist-title">{profileName} · {coinTitle(task.url)}</span><span className="disclosure" aria-hidden="true">⌄</span></span>
     </summary>
     <div className="hist-body">
-      <p className="meta">{profileName}{task.mode === 'observe' && ' · Спостереження'} · за Києвом</p>
+      <p className="meta">{when(task.saleAt, now)} · {profileName}{task.mode === 'observe' && ' · Спостереження'} · за Києвом</p>
+      {task.note && <p className="note">{task.note}</p>}
       <p className="hint url">{task.url}</p>
+      <p className="hint">Кнопка: {offsetSec(task.buttonSeenMs)} · клік: {offsetSec(task.firstClickMs)} · кошик: {offsetSec(task.cartMs)}</p>
       {(task.reloads > 0 || task.clicks > 0) && <p className="hint">Оновлень: {task.reloads} · Натискань: {task.clicks}</p>}
       <Journal task={task} />
     </div>
@@ -249,38 +245,25 @@ function HistoryRow({ task, now, profileName }: { task: Task; now: number; profi
 }
 
 // Seconds from the sale start by the server clock, e.g. "+1,24 с".
-const offsetSec = (ms: number | undefined) => ms === undefined ? '—'
+const offsetSec = (ms: number | undefined) => ms === undefined ? '–'
   : `${ms < 0 ? '−' : '+'}${(Math.abs(ms) / 1000).toLocaleString('uk-UA', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} с`;
-function SaleSummaryView({ sale, now, open, profileName }: { sale: SaleSummary; now: number; open: boolean; profileName: (id: string) => string }) {
-  const coins = new Set(sale.rows.map((row) => row.url)).size;
-  return <details className="sale" open={open}>
+function SaleHistoryView({ tasks, now, profileName }: { tasks: Task[]; now: number; profileName: (id: string) => string }) {
+  const sale = summarizeSales(tasks, now, 1)[0];
+  const inCart = tasks.filter(task => task.status === 'in_cart').length;
+  const errors = tasks.filter(task => task.status === 'failed' || task.status === 'interrupted').length;
+  return <details className="sale">
     <summary>
-      <span className="hist-line"><span className="hist-title">Продаж {when(sale.saleAt, now)}</span>
-        <span className={`pill ${sale.inCart ? 'good' : sale.finished ? 'muted' : 'live'}`}>{sale.inCart}/{sale.total} у кошику</span></span>
-      <span className="sale-stats">
-        Кнопка вперше: <b>{offsetSec(sale.earliestButtonMs)}</b>{sale.medianButtonMs !== undefined && <> · медіана {offsetSec(sale.medianButtonMs)}</>}
-        {sale.medianCartMs !== undefined && <> · кошик, медіана: <b>{offsetSec(sale.medianCartMs)}</b></>}
-      </span>
+      <span className="hist-line"><span className="hist-title">Продаж {when(tasks[0]!.saleAt, now)}</span>
+        <span className={`pill ${inCart ? 'good' : errors ? 'bad' : 'muted'}`}>{inCart}/{tasks.length} у кошику</span>
+        <span className="disclosure" aria-hidden="true">⌄</span></span>
+      <span className="hint">{tasks.length} {plural(tasks.length, 'завдання', 'завдання', 'завдань')}{errors > 0 && ` · помилок: ${errors}`}</span>
     </summary>
-    <div className="sale-scroll"><table className="sale-table">
-      <thead><tr><th>Профіль{coins > 1 && ' · монета'}</th><th>Результат</th>
-        <th title="Коли бот уперше побачив кнопку «Купити» та скільки оновлень сторінки знадобилось">Кнопка</th>
-        <th title="Перше натискання «Купити»">Клік</th><th title="Підтвердження кошика">Кошик</th></tr></thead>
-      <tbody>{sale.rows.map((row) => <tr key={row.taskId}>
-        <td><span className="sale-profile">{profileName(row.profileId)}</span>{coins > 1 && <span className="sale-coin">{coinTitle(row.url)}</span>}</td>
-        <td><span className={`pill ${tones[row.status]}`}>{labels[row.status]}</span>
-          {row.status !== 'in_cart' && row.note && <span className="sale-reason">{row.note}</span>}</td>
-        <td className="num">{row.buttonSeenMs === undefined && row.mode === 'cart' && row.reloads ? 'не було' : offsetSec(row.buttonSeenMs)}
-          {(row.buttonReloads ?? (row.buttonSeenMs === undefined ? row.reloads : undefined)) !== undefined && (() => {
-            const count = row.buttonReloads ?? row.reloads;
-            return <span className="sale-sub">{count} {plural(count, 'оновлення', 'оновлення', 'оновлень')}</span>;
-          })()}</td>
-        <td className="num">{offsetSec(row.firstClickMs)}{row.clicks > 1 && <span className="sale-sub">{row.clicks} кліки</span>}</td>
-        <td className="num">{offsetSec(row.cartMs)}</td>
-      </tr>)}</tbody>
-    </table></div>
-    <p className="hint sale-hint">Час — від старту продажу за годинником сервера НБУ. Повний журнал кожного профілю — у «Завершених».{' '}
-      <button type="button" className="link" onClick={() => void window.desktop.openCaptures().catch(() => {})}>Записи сторінок</button></p>
+    {sale && (sale.earliestButtonMs !== undefined || sale.medianCartMs !== undefined) && <p className="sale-stats">
+      Кнопка вперше: <b>{offsetSec(sale.earliestButtonMs)}</b>{sale.medianButtonMs !== undefined && <> · медіана {offsetSec(sale.medianButtonMs)}</>}
+      {sale.medianCartMs !== undefined && <> · кошик, медіана: <b>{offsetSec(sale.medianCartMs)}</b></>}
+    </p>}
+    <div className="sale-tasks">{tasks.map(task => <HistoryRow key={task.id} task={task} now={now} profileName={profileName(task.profileId)} />)}</div>
+    <p className="hint sale-hint"><button type="button" className="link" onClick={() => void window.desktop.openCaptures().catch(() => {})}>Записи сторінок</button></p>
   </details>;
 }
 
@@ -313,6 +296,7 @@ function App() {
   // Task list
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
   const [showAllHistory, setShowAllHistory] = useState(false);
+  const [taskView, setTaskView] = useState<'active' | 'history'>('active');
   const [accountOpen, setAccountOpen] = useState('');
 
   useEffect(() => {
@@ -401,6 +385,7 @@ function App() {
       await window.desktop.addTasks(profiles.flatMap((profileId) => coinUrls.map((coinUrl) => ({
         url: coinUrl.trim(), profileId, saleAt: saleAtMs, leadMin, retrySec, windowMin, mode: 'cart' as const,
       }))));
+      setTaskView('active');
       setNotice({ kind: 'ok', text: `Заплановано: ${profiles.length * coinUrls.length} ${plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}. Залиште NBU Desktop і AdsPower відкритими.` });
       setUrl(''); setExtraUrls([]); setErrors({});
       // Remember the last used profiles; this is best-effort and must never fail the scheduling.
@@ -439,7 +424,7 @@ function App() {
     const savedProfiles = profileDrafts.map((profile) => ({ id: profile.id.trim(), name: profile.name.trim() }));
     if (savedProfiles.length > 200) found.profiles = 'Можна зберегти до 200 профілів.';
     else if (savedProfiles.some((profile) => !PROFILE_ID.test(profile.id))) found.profiles = 'Вкажіть коректний ID у кожному рядку: латиниця, цифри, «-» та «_».';
-    else if (savedProfiles.some((profile) => profile.name.length > 80)) found.profiles = 'Назва профілю — до 80 символів.';
+    else if (savedProfiles.some((profile) => profile.name.length > 80)) found.profiles = 'Назва профілю – до 80 символів.';
     else if (new Set(savedProfiles.map((profile) => profile.id)).size !== savedProfiles.length) found.profiles = 'Цей ID уже є у списку. Приберіть повтор.';
     setSettingsErrors(found);
     if (found.apiUrl) setUrlOpen(true);
@@ -494,8 +479,14 @@ function App() {
   const attention = tasks.filter((task) => task.status === 'needs_attention').sort((a, b) => a.saleAt - b.saleAt);
   const upcoming = tasks.filter((task) => !isFinal(task.status) && task.status !== 'needs_attention').sort((a, b) => a.saleAt - b.saleAt);
   const history = tasks.filter((task) => isFinal(task.status)).sort((a, b) => b.updatedAt - a.updatedAt);
-  const shownHistory = showAllHistory ? history : history.slice(0, HISTORY_PREVIEW);
-  const sales = summarizeSales(tasks, now, 5);
+  const historyBySale = new Map<number, Task[]>();
+  for (const task of history) {
+    const group = historyBySale.get(task.saleAt) ?? [];
+    group.push(task);
+    historyBySale.set(task.saleAt, group);
+  }
+  const sales = [...historyBySale.entries()].sort(([a], [b]) => b - a);
+  const shownSales = showAllHistory ? sales : sales.slice(0, HISTORY_PREVIEW);
   const open = attention.length + upcoming.length;
   const keyStatus = state?.savedApiKey ? 'Ключ збережено' : state?.hasApiKey ? 'Ключ із середовища' : 'Ключ не задано';
   const today = tasks.filter((task) => dayKey(task.saleAt) === dayKey(now));
@@ -542,30 +533,19 @@ function App() {
           {name === 'tasks' && open > 0 && <span className={`count ${attention.length ? 'attention' : ''}`}>{open}</span>}
         </button>)}
       </div></nav>
-      <section className="side-block" aria-label="Система">
-        <h2 className="cap">Система</h2>
-        <div className="sys-row"><Icon name="link" /><span>AdsPower API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
-        <div className="sys-row"><Icon name="users" /><span>Профілі</span><span className="sys-val">{profiles.length} / {options.length}</span></div>
-        <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val mono">{kyivClock}</span></div>
-        <div className="sys-row" title={offsetTitle}><Icon name="sync" /><span>Зсув сервера</span>
-          <span className="sys-val"><i className={`dot ${offsetDot}`} />{offsetText}</span></div>
-      </section>
-      <section className="side-block" aria-label="Статистика за сьогодні">
-        <h2 className="cap">Статистика (сьогодні)</h2>
-        <StatTile icon="play" label="Завдань" value={todayStats.planned} />
-        <StatTile icon="check" label="У кошику" value={todayStats.cart} />
-        <StatTile icon="cross" label="Помилок" value={todayStats.errors} />
-        <div className="rate"><strong>{successRate === null ? '–' : `${successRate}%`}</strong><span>успішних завдань</span></div>
-      </section>
+        <section className="side-block diagnostics" aria-labelledby="diagnostics-title"><h2 id="diagnostics-title">Діагностика</h2>
+          <div className="sys-row"><Icon name="link" /><span>AdsPower API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
+          <div className="sys-row"><Icon name="users" /><span>Профілі</span><span className="sys-val">{options.length}</span></div>
+          <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val">{kyivClock}</span></div>
+          <div className="sys-row" title={offsetTitle}><Icon name="sync" /><span>Зсув сервера</span><span className="sys-val"><i className={`dot ${offsetDot}`} />{offsetText}</span></div>
+          <details className="diagnostic-details"><summary>Заміри за профілями</summary><p className="hint">{offsetTitle}</p></details>
+          <div className="diagnostic-stats"><h3>Сьогодні</h3><p className="hint">Завдань: {todayStats.planned} · у кошику: {todayStats.cart} · помилок: {todayStats.errors}</p>
+            <p className="hint">Успішних за весь час: {successRate === null ? '–' : `${successRate}%`}</p></div>
+        </section>
     </aside>
     <main>
     <header className="strip">
       <h1>{NAV_LABELS[tab]}</h1>
-      {tab === 'tasks' && <div className="segs" aria-label="Підсумок">
-        <div className="seg"><strong>{upcoming.length}</strong><span className="cap">Наступні</span></div>
-        <div className="seg"><strong className={attention.length ? 'warn' : ''}>{attention.length}</strong><span className="cap">Увага</span></div>
-        <div className="seg"><strong>{history.length}</strong><span className="cap">Завершені</span></div>
-      </div>}
     </header>
     {state?.secretError && <div className="banner" role="alert">{state.secretError}</div>}
     {state?.accountsError && <div className="banner" role="alert">{state.accountsError}</div>}
@@ -573,7 +553,6 @@ function App() {
     <div id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden={tab !== 'tasks'}>
       <div className="workspace">
         <div className="task-tools">
-        <BehaviorTest profiles={options} now={now} />
         <section className="composer" aria-labelledby="new-task"><h2 id="new-task">Нове завдання</h2>
           <form noValidate onSubmit={schedule}>
             <Field id="task-url" label="Посилання на монету" error={errors.url}>
@@ -589,7 +568,7 @@ function App() {
                   onClick={() => setExtraUrls((current) => current.filter((_, i) => i !== index))}><Icon name="cross" size={14} /></button>
               </div>
             </Field>)}
-            <button type="button" className="link add-coin" onClick={() => setExtraUrls((current) => [...current, ''])}>Додати монету</button>
+            <button type="button" className="link add-coin" onClick={() => setExtraUrls((current) => [...current, ''])}>+ Ще монета</button>
             {extraUrls.length > 0 && <p className="hint coin-order">Кожна монета запускається незалежно у своїй вкладці. Спільне вікно очікування: {state?.settings.windowMin ?? 5} хв після старту.</p>}
             <Field id="task-sale" label="Початок продажу, за київським часом" hint={preview} error={errors.saleAt}>
               <input id="task-sale" name="saleAt" type="datetime-local" step={60} value={saleAt}
@@ -600,7 +579,6 @@ function App() {
             <div className="field" role="group" id="task-profiles" tabIndex={-1} aria-labelledby="profiles-label">
               <div className="row-between">
                 <span className="label" id="profiles-label">Профілі{profiles.length > 0 && <span className="muted"> · обрано {profiles.length}</span>}</span>
-                <button type="button" className="link" onClick={() => setTab('settings')}>Керувати</button>
               </div>
               {options.length > 0 && <div className="picker">
                 <label className="check check-select-all">
@@ -619,7 +597,7 @@ function App() {
                   {!shownProfiles.length && <p className="hint">Нічого не знайдено.</p>}
                 </div>
               </div>}
-              {!options.length && <p className="hint">Додайте профілі в налаштуваннях — вони з’являться тут для вибору.</p>}
+              {!options.length && <p className="hint">Додайте профілі в налаштуваннях – вони з’являться тут для вибору.</p>}
               {errors.profiles && <p className="field-error" role="alert">{errors.profiles}</p>}
             </div>
 
@@ -632,12 +610,26 @@ function App() {
             </div>
           </form>
         </section>
+        <BehaviorTest profiles={options} now={now} />
         </div>
 
         <section className="board" aria-labelledby="tasks-title">
           <h2 id="tasks-title">Черга завдань</h2>
-          {!tasks.length && <div className="empty"><p><strong>Завдань ще немає</strong></p>
-            <p>Вставте посилання на монету, оберіть час початку й профіль. Програма відкриє профіль заздалегідь і спрацює в момент старту.</p></div>}
+          <div className="task-tabs" role="tablist" aria-label="Список завдань">
+            {(['active', 'history'] as const).map(view => <button key={view} type="button" role="tab" id={`task-tab-${view}`}
+              aria-selected={taskView === view} aria-controls={`task-panel-${view}`} tabIndex={taskView === view ? 0 : -1}
+              onClick={() => setTaskView(view)} onKeyDown={event => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                event.preventDefault();
+                const next = event.key === 'Home' ? 'active' : event.key === 'End' ? 'history' : view === 'active' ? 'history' : 'active';
+                setTaskView(next); document.getElementById(`task-tab-${next}`)?.focus();
+              }}>{view === 'active' ? 'Активні' : 'Історія'} <span className="tab-total">{view === 'active' ? open : history.length}</span>
+              {view === 'active' && attention.length > 0 && <span className="attention-indicator" title="Потрібна ваша дія" aria-label="Потрібна ваша дія" />}
+            </button>)}
+          </div>
+          <div role="tabpanel" id="task-panel-active" aria-labelledby="task-tab-active" hidden={taskView !== 'active'}>
+          {!open && <div className="empty"><p><strong>Активних завдань немає</strong></p>
+            <p>Створіть нове завдання: додайте монету, час продажу та профілі.</p></div>}
           {attention.length > 0 && <div className="group"><h3 className="group-title attention">Потрібна ваша дія</h3>
             {attention.map((task) => <TaskCard key={task.id} task={task} now={now} profileName={profileName(task.profileId)} busy={busy}
               confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask}
@@ -648,13 +640,15 @@ function App() {
               confirming={confirmStop === task.id} onAsk={setConfirmStop} onStop={stopTask}
               batchSize={task.batchId ? tasks.filter((item) => item.batchId === task.batchId && item.status === 'scheduled').length : 1}
               onSave={updateTask} onReplan={replanTask} />)}</div>}
-          {sales.length > 0 && <div className="group"><h3 className="group-title">Підсумки продажів</h3>
-            <div className="history">{sales.map((sale, index) => <SaleSummaryView key={sale.saleAt} sale={sale} now={now} open={index === 0}
-              profileName={profileName} />)}</div></div>}
-          {history.length > 0 && <div className="group"><h3 className="group-title">Завершені · {history.length}</h3>
-            <div className="history">{shownHistory.map((task) => <HistoryRow key={task.id} task={task} now={now} profileName={profileName(task.profileId)} />)}</div>
-            {history.length > HISTORY_PREVIEW && <button type="button" className="link" onClick={() => setShowAllHistory(!showAllHistory)}>
-              {showAllHistory ? 'Показати менше' : `Показати всі ${history.length}`}</button>}</div>}
+          </div>
+          <div role="tabpanel" id="task-panel-history" aria-labelledby="task-tab-history" hidden={taskView !== 'history'}>
+            {!sales.length && <div className="empty"><p><strong>Історія порожня</strong></p><p>Тут з’являться завершені та скасовані завдання.</p></div>}
+            {sales.length > 0 && <div className="group">
+              <div className="history">{shownSales.map(([saleAt, saleTasks]) => <SaleHistoryView key={saleAt} tasks={saleTasks} now={now} profileName={profileName} />)}</div>
+              {sales.length > HISTORY_PREVIEW && <button type="button" className="link" onClick={() => setShowAllHistory(!showAllHistory)}>
+                {showAllHistory ? 'Показати менше' : `Усі продажі · ${sales.length}`}</button>}
+            </div>}
+          </div>
         </section>
       </div>
     </div>
@@ -683,8 +677,8 @@ function App() {
                 <input id={`profile-id-${index}`} placeholder="ID з таблиці профілів AdsPower" value={profile.id} autoComplete="off" maxLength={80}
                   onChange={(e) => setProfileDrafts((current) => current.map((row, i) => i === index ? { ...row, id: e.target.value } : row))} />
               </Field>
-              <button type="button" className="link danger-text" aria-label={`Видалити профіль ${profile.name || profile.id || index + 1}`}
-                onClick={() => setProfileDrafts((current) => current.filter((_, i) => i !== index))}>Видалити</button>
+              <button type="button" className="profile-remove" title="Видалити профіль" aria-label={`Видалити профіль ${profile.name || profile.id || index + 1}`}
+                onClick={() => setProfileDrafts((current) => current.filter((_, i) => i !== index))}><Icon name="cross" /></button>
               <NbuAccountToggle email={state?.nbuAccounts[id]} saved={saved} open={saved && accountOpen === id}
                 onToggle={() => setAccountOpen((current) => current === id ? '' : id)} />
               {saved && accountOpen === id && <NbuAccountEditor profileId={id} email={state?.nbuAccounts[id]}
@@ -729,14 +723,13 @@ function App() {
           </details>
         </section>
         <section aria-labelledby="timing-title"><h2 id="timing-title">Час виконання</h2>
-          <p className="hint lead">Діє для нових завдань. Уже створені не змінюються.</p>
           <Field id="set-leadMin" label="Відкрити профіль за, хв" error={settingsErrors.leadMin}
             hint="За скільки хвилин до старту відкрити профіль і завантажити сторінку монети.">
             <input id="set-leadMin" inputMode="numeric" value={nums.leadMin} aria-invalid={!!settingsErrors.leadMin}
               onChange={(e) => setNums({ ...nums, leadMin: e.target.value })} />
           </Field>
           <Field id="set-retrySec" label="Повторне оновлення, с" error={settingsErrors.retrySec}
-            hint="Якщо кнопки ще немає, повторне оновлення — через цей інтервал після завантаження сторінки. Мінімум і початкове значення — 1 с.">
+            hint="Якщо кнопки ще немає, повторне оновлення – через цей інтервал після завантаження сторінки. Мінімум і початкове значення – 1 с.">
             <input id="set-retrySec" inputMode="numeric" value={nums.retrySec} aria-invalid={!!settingsErrors.retrySec}
               onChange={(e) => setNums({ ...nums, retrySec: e.target.value })} />
           </Field>

@@ -1,4 +1,4 @@
-import { _electron as electron } from 'playwright-core';
+import { _electron as electron } from 'patchright-core';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,8 @@ const launch = async () => {
   application = await electron.launch({ args: ['.'],
     env: { ...process.env, TZ: 'America/Los_Angeles', NBU_DESKTOP_TEST_DATA: dataDirectory, ADSPOWER_API_KEY: '' }, timeout: 30_000 });
   const page = await application.firstWindow();
+  await page.route('https://cdn-nbu.solomono.net/bank/images/ui-test-*.svg', route => route.request().url().includes('missing') ? route.abort()
+    : route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><circle cx="40" cy="40" r="34" fill="#ddd6bc" stroke="#9e9577" stroke-width="3"/><text x="40" y="50" text-anchor="middle" font-size="28" fill="#605638">N</text></svg>' }));
   await page.getByRole('heading', { name: 'Нове завдання' }).waitFor();
   await page.waitForFunction(() => !document.querySelector('button[type="submit"]')?.disabled);
   return page;
@@ -77,23 +79,25 @@ try {
   await page.getByLabel('Повторне оновлення, с').fill('1');
   await page.getByRole('button', { name: 'Зберегти налаштування', exact: true }).click();
   await page.getByText('Налаштування збережено.', { exact: true }).waitFor();
-  let localState = await page.evaluate(() => window.desktop.state());
+  let localState = await page.evaluate(() => window.desktop.state(), undefined, undefined, false);
   assert.equal(localState.hasApiKey, false);
   assert.deepEqual(localState.settings.savedProfiles, [{ id: 'profile_a', name: 'Основний' }, { id: 'profile_b', name: 'Другий' }]);
   assert.equal(profileRequests, 0); // The local list works without any AdsPower request.
   // Exercise the actual cabinet UI through isolated IPC fixtures; never open a real profile.
   await application.evaluate(({ ipcMain, app }) => {
     app.cabinetReads = { snapshots: 0, details: 0 };
+    app.cabinetOpenProfiles = [];
     ipcMain.removeHandler('load-cabinet');
     ipcMain.handle('load-cabinet', (_event, input) => {
       const profileId = typeof input === 'string' ? input : input.profileId;
       app.cabinetReads.snapshots++;
+      app.cabinetOpenProfiles.push(input.openProfile);
       return { profileId, fetchedAt: Date.now(), errors: {}, wishlist: [],
         orders: [{ id: '100', detailId: profileId === 'profile_a' ? '777' : undefined, date: '27.08.2026', status: 'Оплачено', quantity: 2, total: profileId === 'profile_a' ? 100 : 200, tracking: '123456' },
           ...(profileId === 'profile_a' ? [{ id: '101', mergedInto: '100', date: '27.08.2026', status: 'Об’єднано в №100', quantity: 1, total: 50, tracking: '' },
             ...Array.from({ length: 11 }, (_, i) => ({ id: String(200 + i), date: '26.08.2026', status: 'Отримано', quantity: 1, total: 50, tracking: '' }))] : [])],
         nextOrdersPage: profileId === 'profile_a' ? 2 : undefined,
-        cart: [{ id: '42', name: 'Тестова монета', quantity: 2, price: 50, total: 100 }] };
+        cart: [{ id: '42', name: 'Тестова монета', quantity: 2, price: 50, total: 100, imageUrl: `https://cdn-nbu.solomono.net/bank/images/ui-test-${profileId === 'profile_a' ? 'coin' : 'missing'}.svg` }] };
     });
     app.cabinetPageReads = 0;
     ipcMain.removeHandler('load-cabinet-orders');
@@ -114,6 +118,7 @@ try {
   assert.deepEqual(await application.evaluate(({ app }) => app.cabinetReads), { snapshots: 0, details: 0 });
   await page.getByRole('tab', { name: 'Кабінет', exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll('.order-card').length === 10);
+  assert.deepEqual(await application.evaluate(({ app }) => app.cabinetOpenProfiles), [false, false]);
   assert.equal(await cabinet.getByRole('button', { name: /Оновити через/ }).isDisabled(), true);
   await cabinet.getByRole('button', { name: 'Дивитись замовлення 100 · Основний', exact: true }).click();
   await cabinet.getByText('Тестова адреса', { exact: true }).waitFor();
@@ -133,6 +138,13 @@ try {
   assert.equal(await cabinet.locator('.order-card').count(), 10);
   await cabinet.getByRole('tab', { name: /Кошик/ }).click();
   await cabinet.getByRole('heading', { name: 'Тестова монета' }).waitFor();
+  await page.waitForFunction(() => [...document.querySelectorAll('.product-image img')].some(image => image.complete && image.naturalWidth > 0));
+  assert.equal(await cabinet.getByRole('img', { name: 'Тестова монета', exact: true }).isVisible(), true);
+  await page.screenshot({ path: join(dataDirectory, 'cart-photo.png'), fullPage: true });
+  await cabinet.getByRole('combobox', { name: 'Профіль кабінету' }).selectOption('profile_b');
+  await cabinet.getByRole('img', { name: 'Фото відсутнє', exact: true }).waitFor();
+  assert.equal(await cabinet.getByRole('heading', { name: 'Тестова монета' }).isVisible(), true);
+  await cabinet.getByRole('combobox', { name: 'Профіль кабінету' }).selectOption('profile_a');
   await cabinet.getByRole('tab', { name: /Бажане/ }).click();
   await cabinet.getByRole('heading', { name: 'Бажане порожнє' }).waitFor();
   assert.deepEqual(await application.evaluate(({ app }) => app.cabinetReads), { snapshots: 2, details: 2 });
@@ -158,39 +170,44 @@ try {
     ipcMain.removeHandler('stop-behavior-test');
     ipcMain.handle('stop-behavior-test', (_event, profileId) => {
       app.stoppedBehaviorProfiles.push(profileId);
-      app.finishBehaviorTests.get(profileId)({ moves: 1, scrolls: 0, navigations: 0, stopped: true, durationMs: 1000 });
+      app.finishBehaviorTests.get(profileId)({ moves: 1, scrolls: 0, navigations: 0, pauses: 0, stopped: true, durationMs: 1000, login: 'logged-in' });
     });
   });
   await page.getByRole('tab', { name: 'Завдання', exact: true }).click();
-  const behavior = page.getByRole('region', { name: 'Тест поведінки', exact: true });
+  const behavior = page.getByRole('region', { name: 'Прогрів профілів', exact: true });
   const compact = await behavior.boundingBox();
-  assert.ok(compact.width <= 420 && compact.height < 240);
+  assert.ok(compact.width <= 420 && compact.height < 100);
   await behavior.screenshot({ path: join(dataDirectory, 'behavior-compact.png') });
+  assert.equal(await behavior.getByRole('spinbutton').isVisible(), false);
+  await behavior.getByRole('button', { name: 'Прогрів профілів', exact: true }).click();
   await behavior.locator('summary').click();
-  await behavior.getByRole('spinbutton', { name: 'Тривалість тесту, хв' }).fill('3');
-  await behavior.getByRole('button', { name: /^Профілі для тесту:/ }).click();
+  await behavior.getByRole('spinbutton', { name: 'Тривалість прогріву, хв' }).fill('3');
+  await behavior.getByRole('button', { name: /^Профілі для прогріву:/ }).click();
   await behavior.getByRole('button', { name: 'Очистити', exact: true }).click();
-  assert.equal(await behavior.getByRole('button', { name: 'Тест', exact: true }).isDisabled(), true);
+  assert.equal(await behavior.getByRole('button', { name: 'Прогріти', exact: true }).isDisabled(), true);
   await behavior.getByRole('checkbox', { name: 'Основний', exact: true }).check();
   await behavior.getByRole('checkbox', { name: 'Основний', exact: true }).press('Escape');
-  await behavior.getByRole('button', { name: 'Тест', exact: true }).click();
-  await behavior.getByRole('button', { name: 'Зупинити тест', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Прогріти', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Зупинити прогрів', exact: true }).click();
   await behavior.getByRole('log').getByText(/Основний: зупинено/).waitFor();
   assert.deepEqual(await application.evaluate(({ app }) => app.behaviorCalls.map(call => call.profileId)), ['profile_a']);
   await application.evaluate(({ app }) => { app.behaviorCalls = []; app.stoppedBehaviorProfiles = []; });
-  await behavior.getByRole('button', { name: /^Профілі для тесту:/ }).click();
+  await behavior.getByRole('button', { name: /^Профілі для прогріву:/ }).click();
   await behavior.getByRole('checkbox', { name: 'Другий', exact: true }).check();
   assert.equal(await behavior.getByRole('checkbox', { name: 'Основний', exact: true }).isChecked(), true);
   await behavior.screenshot({ path: join(dataDirectory, 'behavior-profiles.png') });
   await behavior.getByRole('checkbox', { name: 'Другий', exact: true }).press('Escape');
-  await behavior.getByRole('button', { name: 'Тест', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Прогрів профілів', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Прогріти', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.behavior-test [role="status"]').textContent.includes('Активних профілів: 2'));
   assert.deepEqual(await application.evaluate(({ app }) => app.behaviorCalls.map(call => [call.profileId, call.minutes])), [['profile_a', 3], ['profile_b', 3]]);
-  await behavior.getByRole('button', { name: 'Зупинити тест', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Зупинити прогрів', exact: true }).click();
+  await behavior.getByRole('button', { name: 'Прогрів профілів', exact: true }).click();
   await behavior.getByRole('log').getByText(/Основний: зупинено/).waitFor();
   await behavior.getByRole('log').getByText(/Другий: зупинено/).waitFor();
   assert.deepEqual(await application.evaluate(({ app }) => app.stoppedBehaviorProfiles.sort()), ['profile_a', 'profile_b']);
   await behavior.screenshot({ path: join(dataDirectory, 'behavior-test.png') });
+  await behavior.getByRole('button', { name: 'Прогрів профілів', exact: true }).click();
   await page.getByRole('tab', { name: 'Налаштування', exact: true }).click();
 
   await page.locator('.profile-import > summary').click();
@@ -208,7 +225,7 @@ try {
   await page.getByRole('checkbox', { name: /Основний/ }).check();
   await page.getByRole('checkbox', { name: /Другий/ }).check();
   await page.getByLabel('Посилання на монету').fill('https://coins.bank.gov.ua/test-coin.html');
-  await page.getByRole('button', { name: 'Додати монету', exact: true }).click();
+  await page.getByRole('button', { name: '+ Ще монета', exact: true }).click();
   await page.getByLabel('Монета 2', { exact: true }).fill('https://coins.bank.gov.ua/second-coin.html');
   const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
   await page.locator('[name="saleAt"]').fill(`${tomorrow}T10:00`);
@@ -252,13 +269,25 @@ try {
 
   // A task that has not started is cancelled at once; no confirmation is needed.
   await page.getByRole('button', { name: 'Зупинити', exact: true }).first().click();
-  await page.getByText('Скасовано', { exact: true }).waitFor();
+  await page.waitForFunction(() => document.querySelectorAll('#task-panel-active .task').length === 3);
   assert.equal(await page.getByText('Заплановано', { exact: true }).count(), 3);
   for (let remaining = 3; remaining > 0; remaining--) {
     await page.getByRole('button', { name: 'Зупинити', exact: true }).first().click();
     await page.waitForFunction(async (count) => (await window.desktop.state()).tasks.filter((task) => task.status === 'scheduled').length === count, remaining - 1);
   }
   await page.waitForFunction(async () => (await window.desktop.state()).tasks.every((task) => task.status === 'cancelled'));
+  await page.getByText('Активних завдань немає', { exact: true }).waitFor();
+  await page.getByRole('tab', { name: /^Історія/ }).click();
+  assert.equal(await page.locator('.sale').count(), 1);
+  assert.equal(await page.locator('.hist').count(), 4);
+  assert.equal(await page.locator('.hist').first().isVisible(), false);
+  await page.locator('.sale > summary').click();
+  assert.equal(await page.getByText('Скасовано', { exact: true }).first().isVisible(), true);
+  await page.locator('.hist > summary').first().click();
+  await page.locator('.hist').first().getByRole('log').waitFor();
+  await page.getByRole('tab', { name: /^Історія/ }).press('ArrowLeft');
+  assert.equal(await page.getByRole('tab', { name: /^Активні/ }).getAttribute('aria-selected'), 'true');
+  await page.getByRole('tab', { name: /^Активні/ }).press('ArrowRight');
   const persisted = await readFile(join(dataDirectory, 'tasks.json'), 'utf8');
   assert.equal(persisted.includes(secret), false);
   const saved = JSON.parse(persisted).tasks;
@@ -277,7 +306,7 @@ try {
   assert.deepEqual(errors, []);
   await application.close();
   page = await launch();
-  const restored = await page.evaluate(() => window.desktop.state());
+  const restored = await page.evaluate(() => window.desktop.state(), undefined, undefined, false);
   assert.equal(restored.hasApiKey, true); assert.equal(restored.savedApiKey, true);
   assert.equal(JSON.stringify(restored).includes(secret), false);
   assert.equal(restored.settings.retrySec, 1);
@@ -306,10 +335,12 @@ try {
   assert.equal(await application.evaluate(({ app }) => app.cabinetRestartReads), 0);
   await restoredCabinet.getByRole('checkbox', { name: /Автооновлення/ }).uncheck();
   await page.getByRole('tab', { name: 'Налаштування', exact: true }).click();
+  assert.equal(await page.getByRole('heading', { name: 'Діагностика' }).isVisible(), true);
+  assert.equal(await page.locator('.side .sys-row').count(), 4);
   // Saving a blank key keeps the existing encrypted key.
   await page.getByRole('button', { name: 'Зберегти налаштування', exact: true }).click();
   await page.getByText('Налаштування збережено.', { exact: true }).waitFor();
-  assert.equal((await page.evaluate(() => window.desktop.state())).savedApiKey, true);
+  assert.equal((await page.evaluate(() => window.desktop.state(), undefined, undefined, false)).savedApiKey, true);
   await page.getByRole('button', { name: 'Видалити профіль Другий', exact: true }).click();
   await page.getByRole('button', { name: 'Зберегти налаштування', exact: true }).click();
   await page.waitForFunction(async () => (await window.desktop.state()).settings.savedProfiles.length === 1);
@@ -317,9 +348,84 @@ try {
   await page.getByText('Збережений ключ видалено.', { exact: true }).waitFor();
   await application.close();
   page = await launch();
-  assert.equal((await page.evaluate(() => window.desktop.state())).hasApiKey, false);
+  assert.equal((await page.evaluate(() => window.desktop.state(), undefined, undefined, false)).hasApiKey, false);
   assert.equal(await page.getByRole('checkbox', { name: /Другий/ }).count(), 0);
   assert.equal(await page.getByRole('checkbox', { name: /Основний/ }).count(), 1);
+  // Exercise grouped history with mixed outcomes, old sales and future cancellations.
+  const fixtureState = await page.evaluate(() => window.desktop.state(), undefined, undefined, false);
+  const baseTask = fixtureState.tasks[0];
+  const now = Date.now();
+  fixtureState.tasks = Array.from({ length: 7 }, (_, index) => ({ ...baseTask, id: `history-${index}`,
+    saleAt: now - index * 86400000, updatedAt: now, url: 'https://coins.bank.gov.ua/pamiatna-moneta/p-42.html',
+    status: index === 0 ? 'in_cart' : index === 1 ? 'failed' : 'cancelled',
+    note: index === 0 ? 'Монета у кошику. Завершіть оформлення у браузері.' : 'Тестовий результат',
+    buttonSeenMs: index === 0 ? 6130 : undefined, cartMs: index === 0 ? 12190 : undefined }));
+  fixtureState.tasks.push({ ...fixtureState.tasks[0], id: 'same-sale-failure', status: 'failed', note: 'Тестова помилка', cartMs: undefined });
+  await application.evaluate(({ ipcMain }, fixture) => {
+    ipcMain.removeHandler('state'); ipcMain.handle('state', () => fixture);
+  }, fixtureState);
+  await page.getByRole('tab', { name: /^Історія/ }).click();
+  await page.waitForFunction(() => document.querySelectorAll('.sale').length === 5);
+  const firstSale = page.locator('.sale').first();
+  assert.equal(await firstSale.locator(':scope > summary').getByText('1/2 у кошику', { exact: true }).isVisible(), true);
+  assert.equal(await firstSale.locator('.sale-stats').isVisible(), false);
+  await page.screenshot({ path: join(dataDirectory, 'simplified-history.png'), fullPage: true });
+  await firstSale.locator(':scope > summary').click();
+  assert.equal(await firstSale.locator('.hist').count(), 2);
+  assert.equal(await firstSale.getByText('Монета у кошику. Завершіть оформлення у браузері.', { exact: true }).isVisible(), false);
+  await firstSale.locator('.hist > summary').first().click();
+  await firstSale.getByRole('log').first().waitFor();
+  await page.getByRole('button', { name: 'Усі продажі · 7', exact: true }).click();
+  assert.equal(await page.locator('.sale').count(), 7);
+  await page.getByRole('button', { name: 'Показати менше', exact: true }).click();
+  assert.equal(await page.locator('.sale').count(), 5);
+  await page.setViewportSize({ width: 980, height: 800 });
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  await page.screenshot({ path: join(dataDirectory, 'simplified-narrow.png'), fullPage: true });
+  await application.evaluate(({ ipcMain, app }) => {
+    app.manualCabinetRequests = [];
+    ipcMain.removeHandler('load-cabinet');
+    ipcMain.handle('load-cabinet', (_event, input) => {
+      app.manualCabinetRequests.push(input);
+      return { profileId: input.profileId, fetchedAt: Date.now(), orders: [], wishlist: [], cart: [], errors: {} };
+    });
+  });
+  await page.clock.install({ time: new Date(Date.now() + 120_000) });
+  await page.clock.runFor(1100);
+  await page.getByRole('tab', { name: 'Кабінет', exact: true }).click();
+  await page.getByRole('button', { name: 'Оновити кабінет', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('.cabinet').getAttribute('aria-busy') || document.querySelector('.cabinet').getAttribute('aria-busy') === 'false');
+  const manualRequests = await application.evaluate(({ app }) => app.manualCabinetRequests);
+  assert.equal(manualRequests.length, 1);
+  assert.equal(manualRequests[0].profileId, 'profile_a');
+  assert.equal(manualRequests[0].openProfile, true);
+  // A retry replaces old connection/section errors with progress until its own result arrives.
+  for (const sectionError of [false, true]) {
+    await application.evaluate(({ ipcMain }, partial) => {
+      ipcMain.removeHandler('load-cabinet');
+      ipcMain.handle('load-cabinet', (_event, input) => {
+        if (!partial) throw Error('Попередня помилка підключення');
+        return { profileId: input.profileId, fetchedAt: Date.now(), orders: [], wishlist: [], errors: { cart: 'Попередня помилка кошика' } };
+      });
+    }, sectionError);
+    await page.clock.fastForward(61_000);
+    await page.getByRole('button', { name: 'Оновити кабінет', exact: true }).click();
+    await page.locator('.cabinet').getByRole('tab', { name: /^Кошик/ }).click();
+    await page.locator('.cabinet-profile-state [role="alert"]').waitFor();
+    await application.evaluate(({ ipcMain, app }) => {
+      ipcMain.removeHandler('load-cabinet');
+      ipcMain.handle('load-cabinet', (_event, input) => new Promise(resolve => {
+        app.finishCabinetRetry = () => resolve({ profileId: input.profileId, fetchedAt: Date.now(), orders: [], wishlist: [], cart: [], errors: {} });
+      }));
+    });
+    await page.clock.fastForward(61_000);
+    await page.getByRole('button', { name: 'Оновити кабінет', exact: true }).click();
+    await page.getByText('Підключення й оновлення: Основний…', { exact: true }).waitFor();
+    assert.equal(await page.locator('.cabinet-profile-state [role="alert"]').count(), 0);
+    await application.evaluate(({ app }) => app.finishCabinetRetry());
+    await page.waitForFunction(() => document.querySelector('.cabinet').getAttribute('aria-busy') === 'false');
+    assert.equal(await page.locator('.cabinet-profile-state [role="alert"]').count(), 0);
+  }
   console.log(`UI smoke passed: local profiles without API, duplicates, deletion and restart, inline validation, multi-profile scheduling, independent cancellation, encrypted key restart/clear, Inter, Kyiv time. Screenshots: ${dataDirectory}`);
 } finally {
   if (application) await application.evaluate(({ app }) => app.exit(0)).catch(() => {});

@@ -41,3 +41,13 @@ it('recovers from corrupt cache and reports failed writes without losing the pre
   expect(restoreCabinet({ getItem: () => '{broken' }, 'one', ['a']).snapshots).toEqual({});
   expect(persistCabinet({ setItem: () => { throw Error('quota'); } }, 'one', ['a'], state(100_000))).toBe(false);
 });
+
+it('preserves product photos in the cabinet cache', () => {
+  const disk = storage(), before = state(100_000);
+  const product = { id: '42', name: 'Монета', quantity: 1, price: 50, total: 50, imageUrl: 'https://coins.bank.gov.ua/images/42.jpg' };
+  before.snapshots.a!.cart = [product]; before.snapshots.a!.wishlist = [product];
+  persistCabinet(disk, 'one', ['a'], before);
+  const restored = restoreCabinet(disk, 'one', ['a']);
+  expect(restored.snapshots.a?.cart?.[0]?.imageUrl).toBe(product.imageUrl);
+  expect(restored.snapshots.a?.wishlist?.[0]?.imageUrl).toBe(product.imageUrl);
+});

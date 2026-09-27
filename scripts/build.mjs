@@ -6,7 +6,7 @@ await mkdir('dist/licenses', { recursive: true });
 await copyFile('third-party/Inter-OFL.txt', 'dist/licenses/Inter-OFL.txt');
 await Promise.all([
   build({ entryPoints: ['src/main/index.ts'], outfile: 'dist/main.cjs', bundle: true,
-    platform: 'node', target: 'node20', format: 'cjs', external: ['electron', 'playwright-core'] }),
+    platform: 'node', target: 'node20', format: 'cjs', external: ['electron', 'patchright-core'] }),
   build({ entryPoints: ['src/main/preload.ts'], outfile: 'dist/preload.cjs', bundle: true,
     platform: 'node', target: 'node20', format: 'cjs', external: ['electron'] }),
   build({ entryPoints: ['src/renderer/app.tsx'], outfile: 'dist/app.js', bundle: true,

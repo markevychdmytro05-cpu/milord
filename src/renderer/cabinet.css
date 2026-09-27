@@ -48,6 +48,15 @@
 .wishlist-card { padding: 20px; border: 1px solid var(--line); background: var(--panel); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; gap: 20px; }
 .wishlist-card h2 { margin-top: 8px; font-family: inherit; font-size: 15px; letter-spacing: 0; text-transform: none; }
 .wishlist-card > strong { white-space: nowrap; }
+.product-description { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.product-image { width: 80px; height: 80px; flex: none; display: grid; place-items: center; background: var(--head); }
+.product-image img { width: 100%; height: 100%; object-fit: contain; }
+.product-image-empty { display: grid; place-items: center; color: var(--muted); }
+@media (max-width: 800px) {
+  .wishlist-card { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px 14px; padding: 14px; }
+  .product-image { width: 64px; height: 64px; }
+  .wishlist-card > strong { grid-column: 2; }
+}
 @media (max-width: 1050px) {
   .cabinet-layout.with-detail { grid-template-columns: minmax(0, 1fr); }
   .cabinet-layout.with-detail > .cabinet-list { max-height: 260px; }

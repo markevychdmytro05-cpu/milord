@@ -1,4 +1,4 @@
-import type { BrowserContext, Page } from 'playwright-core';
+import type { BrowserContext, Page } from 'patchright-core';
 import { realClock, type Clock } from '../core/ports';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
 import type { PreparationGate } from './adspower';

@@ -396,3 +396,35 @@ describe('reload interval', () => {
     expect(reloadIntervalMs(200_000, 30)).toBe(30_000);
   });
 });
+
+describe('pointer before the sale', () => {
+  it('moves the pointer while waiting, parks it on the button before the sale and never during it', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, inCart: browser.clicks.length > 0 }));
+    const idles: Array<[number, number]> = [];
+    const approaches: Array<[number, number]> = [];
+    browser.session.idle = async (ms) => { idles.push([clock.now(), ms]); clock.time += ms / 2; };
+    browser.session.approach = async (ms) => { approaches.push([clock.now(), ms]); clock.time += ms; };
+    const input = task({ saleAt: clock.time + 20_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(idles.length).toBeGreaterThan(5);
+    for (const [at, ms] of idles) expect(at + ms).toBeLessThanOrEqual(input.saleAt - 3000);
+    expect(approaches).toHaveLength(1);
+    const [at, ms] = approaches[0]!;
+    expect(at + ms).toBeLessThanOrEqual(input.saleAt - 1000);
+    expect(Math.max(...idles.map(([time]) => time))).toBeLessThan(at);
+    expect(browser.clicks[0]).toBeGreaterThanOrEqual(input.saleAt);
+  });
+
+  it('keeps buying when pointer movement fails', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, inCart: browser.clicks.length > 0 }));
+    browser.session.idle = async () => { throw new Error('page closed'); };
+    browser.session.approach = async () => { throw new Error('page closed'); };
+    const input = task({ saleAt: clock.time + 10_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toHaveLength(1);
+  });
+});

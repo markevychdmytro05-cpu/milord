@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Page, Response } from 'playwright-core';
+import type { Page, Response } from 'patchright-core';
 import type { CaptureRequest } from '../core/ports';
 
 // Development aid: keeps what the shop showed around a purchase, so unseen markup (a moving queue,

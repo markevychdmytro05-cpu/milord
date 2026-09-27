@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { chromium } from 'playwright-core';
+import { chromium } from 'patchright-core';
 import { mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

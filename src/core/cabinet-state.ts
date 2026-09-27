@@ -10,7 +10,7 @@ const amount = z.number().finite().nullable();
 const order = z.object({ id, detailId: id.optional(), mergedInto: id.optional(), date: text,
   status: text, total: amount, quantity: amount, tracking: text });
 const product = z.object({ id: text, name: text, quantity: amount, price: amount, total: amount,
-  url: text.optional(), reservedUntil: text.optional() });
+  url: text.optional(), imageUrl: text.optional(), reservedUntil: text.optional() });
 const details = z.object({ id, delivery: text, deliveryCost: text, address: text, payment: text, total: amount,
   products: z.array(product), history: z.array(z.object({ at: text, status: text })) });
 export const defaultCabinetView = { section: 'orders' as CabinetSection, profile: '', query: '', page: 1 };

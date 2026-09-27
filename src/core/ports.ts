@@ -28,7 +28,12 @@ export interface ShopSession {
   // Development record of the page (HTML, text, the page's own XHR). Never called before the first click
   // in the sale window: a page dump shares the CDP channel with the click.
   capture?(request: CaptureRequest): Promise<void>;
-  clickBuy(): Promise<void>;
+  // Before the sale only: unhurried pointer movement for at most `ms`. Never a click, key, navigation or scroll.
+  idle?(ms: number): Promise<void>;
+  // Before the sale only: brings the pointer to rest on the buy button within `ms`, scrolling it into view if needed.
+  approach?(ms: number): Promise<void>;
+  // 'mouse': a real pointer click; 'dom': the fallback DOM click.
+  clickBuy(): Promise<'mouse' | 'dom' | void>;
   disconnect(): Promise<void>;
 }
 

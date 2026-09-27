@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { chromium } from 'playwright-core';
+import { chromium } from 'patchright-core';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';

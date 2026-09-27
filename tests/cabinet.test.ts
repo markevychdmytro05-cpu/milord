@@ -1,10 +1,10 @@
 import { JSDOM } from 'jsdom';
-import { chromium, type Browser } from 'playwright-core';
+import { chromium, type Browser } from 'patchright-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readCabinetPage } from '../src/browser/cabinet-page';
 import { CabinetReader, fetchCabinetDocument } from '../src/browser/cabinet';
-import { AdsPowerClient, PreparationGate } from '../src/browser/adspower';
-import { ShopRequestGuard } from '../src/core/shop-errors';
+import { AdsPowerClient, AdsPowerConnectionError, PreparationGate } from '../src/browser/adspower';
+import { ShopRequestGuard, UserFacingError } from '../src/core/shop-errors';
 import { CabinetCache } from '../src/main/cabinet-cache';
 
 const login = '<a href="logoff.php">Вийти</a>';
@@ -31,6 +31,28 @@ describe('cabinet DOM extraction', () => {
     expect(readCabinetPage({ section: 'cart', html: cart }).products?.[0]).toMatchObject({ id: '42', name: 'Монета',
       quantity: 2, price: 1000, total: 2000, reservedUntil: '2026-09-26 12:30:00' });
   });
+  it('extracts cart photos and normalizes relative and lazy image URLs', () => {
+    for (const image of ['<img src="images/coin.jpg">', '<img src="data:image/gif;base64,AAAA" data-src="/images/coin.jpg">', '<img data-original="//coins.bank.gov.ua/images/coin.jpg">']) {
+      const html = cart.replace('<div class="product_name">', image + '<div class="product_name">');
+      expect(readCabinetPage({ section: 'cart', html }).products?.[0]?.imageUrl).toBe('https://coins.bank.gov.ua/images/coin.jpg');
+    }
+  });
+  it('keeps products without photos and ignores external or invalid photo URLs', () => {
+    for (const source of ['https://example.org/coin.jpg', 'javascript:alert(1)', 'file:///tmp/coin.jpg', 'https://coins.bank.gov.ua.evil.invalid/a.jpg', 'http://[']) {
+      const html = cart.replace('<div class="product_name">', `<img src="${source}"><div class="product_name">`);
+      const result = readCabinetPage({ section: 'cart', html });
+      expect(result.products).toHaveLength(1);
+      expect(result.products?.[0]?.imageUrl).toBeUndefined();
+    }
+  });
+  it('associates wishlist photos with the correct product', () => {
+    const html = `${login}<div class="content-wishList-wrap">${[42, 43].map(id => `<div>
+      <a href="coin/p-${id}.html"><img src="/images/${id}.jpg"></a>
+      <a href="coin/p-${id}.html">Монета ${id}</a><span class="new_price">50 грн</span></div>`).join('')}</div>`;
+    expect(readCabinetPage({ section: 'wishlist', html }).products?.map(p => [p.id, p.imageUrl])).toEqual([
+      ['42', 'https://coins.bank.gov.ua/images/42.jpg'], ['43', 'https://coins.bank.gov.ua/images/43.jpg'],
+    ]);
+  });
   it('distinguishes recognized empty lists from broken HTML and login/challenge pages', () => {
     expect(readCabinetPage({ section: 'wishlist', html: wishlist })).toEqual({ products: [] });
     expect(readCabinetPage({ section: 'cart', html: '<h1>Ваш кошик порожній</h1>' })).toEqual({ products: [] });
@@ -45,6 +67,24 @@ describe('cabinet DOM extraction', () => {
     expect(readCabinetPage({ section: 'wishlist', html }).products).toEqual([
       { id: '42', name: 'Монета', price: 50, total: 50, quantity: 1, url: 'https://coins.bank.gov.ua/coin/p-42.html' },
     ]);
+  });
+  it('reads the live NBU wishlist table with CDN lazy photos and unlabelled price cells', () => {
+    const html = `${login}<div class="content-wishList-wrap"><div class="table-responsive">
+      <table id="wishlist_table" class="typical_table"><thead><tr><th>Зображення</th><th>Назва</th><th>Вартість</th><th></th></tr></thead>
+      <tbody>${[1126, 1127].map((id, i) => `<tr>
+        <td class="productListing-data"><a href="arhistratig-mihajil-c-/p-${id}.html">
+          <img class="lazyload" src="https://cdn-nbu.solomono.net/bank/images/pixel_trans.png"
+            data-src="https://cdn-nbu.solomono.net/bank/images/cache/100x100/coin-${id}.png"></a></td>
+        <td class="productListing-data"><a href="arhistratig-mihajil-c-/p-${id}.html">Архістратиг Михаїл ${id}</a></td>
+        <td class="productListing-data">${i ? '5 000' : '4   969'} грн</td>
+        <td><a href="wishlist.php?delete_prod=${id}">Видалити</a><button data-id="${id}">Купити</button></td>
+      </tr>`).join('')}</tbody></table></div></div>`;
+    expect(readCabinetPage({ section: 'wishlist', html }).products?.map(p => [p.id, p.price, p.imageUrl])).toEqual([
+      ['1126', 4969, 'https://cdn-nbu.solomono.net/bank/images/cache/100x100/coin-1126.png'],
+      ['1127', 5000, 'https://cdn-nbu.solomono.net/bank/images/cache/100x100/coin-1127.png'],
+    ]);
+    const cartHtml = cart.replace('<div class="product_name">', '<img data-src="https://cdn-nbu.solomono.net/bank/images/coin.png"><div class="product_name">');
+    expect(readCabinetPage({ section: 'cart', html: cartHtml }).products?.[0]?.imageUrl).toBe('https://cdn-nbu.solomono.net/bank/images/coin.png');
   });
   it('reads detail fields and row totals, and refuses a different order ID', () => {
     const html = `${login}<div class="col-account-content"><h1>Замовлення #123</h1><div id="account_order_info">
@@ -79,7 +119,7 @@ describe('cabinet request cache', () => {
   });
 });
 
-function browserFixture(firstHtml = orders, limited = false) {
+function browserFixture(firstHtml = orders, limited = false, openProfile = false) {
   const paths: string[] = [];
   const shopPage = {
     goto: vi.fn(), reload: vi.fn(), isClosed: () => false,
@@ -97,12 +137,12 @@ function browserFixture(firstHtml = orders, limited = false) {
   const foreignPage = { close: vi.fn(), goto: vi.fn(), isClosed: () => false, url: () => 'https://example.org/' };
   const close = vi.fn(async () => {}), newPage = vi.fn();
   const pages = [foreignPage, shopPage];
-  vi.spyOn(chromium, 'connectOverCDP').mockResolvedValue({ contexts: () => [{ newPage, pages: () => pages }], close } as unknown as Browser);
+  vi.spyOn(chromium, 'connectOverCDP').mockResolvedValue({ contexts: () => [{ newPage, pages: () => pages, on: vi.fn() }], close } as unknown as Browser);
   const client = new AdsPowerClient('http://localhost:50325', '');
   const active = vi.spyOn(client, 'active').mockResolvedValue('ws://localhost:54321/devtools/browser/test');
   const start = vi.spyOn(client, 'start');
   const guard = new ShopRequestGuard();
-  const reader = new CabinetReader(client, guard, new PreparationGate(0));
+  const reader = new CabinetReader(client, guard, new PreparationGate(0), undefined, openProfile);
   return { reader, shopPage, foreignPage, close, guard, paths, active, start, newPage, pages };
 }
 it('reads three documents through the existing session without starting, navigating, focusing or closing tabs', async () => {
@@ -200,4 +240,55 @@ it('fetches combined details by their URL ID while verifying the displayed order
   expect((await reader.order('a', '900', new AbortController().signal, '123')).id).toBe('900');
   expect(paths).toEqual(['/account_history_info.php?order_id=123']);
   await expect(reader.order('a', '999', new AbortController().signal, '123')).rejects.toThrow('Не вдалося розпізнати');
+});
+
+it('manual refresh starts a closed profile and opens the shop in a new tab', async () => {
+  const { reader, active, start, pages, newPage, shopPage, foreignPage, close } = browserFixture(orders, false, true);
+  active.mockResolvedValueOnce(undefined);
+  start.mockResolvedValueOnce('ws://localhost:54321/devtools/browser/test');
+  pages.pop(); newPage.mockResolvedValueOnce(shopPage);
+  expect((await reader.load('a', new AbortController().signal)).cart).toHaveLength(1);
+  expect(start).toHaveBeenCalledOnce(); expect(newPage).toHaveBeenCalledOnce();
+  expect(shopPage.goto).toHaveBeenCalledWith('https://coins.bank.gov.ua/', expect.objectContaining({ waitUntil: 'domcontentloaded' }));
+  expect(foreignPage.goto).not.toHaveBeenCalled(); expect(shopPage.close).not.toHaveBeenCalled();
+  expect(close).toHaveBeenCalledOnce();
+});
+it('manual refresh uses the launch-capable start path when AdsPower is unavailable', async () => {
+  const { reader, active, start } = browserFixture(orders, false, true);
+  active.mockRejectedValueOnce(new AdsPowerConnectionError('Local API недоступний'));
+  start.mockResolvedValueOnce('ws://localhost:54321/devtools/browser/test');
+  expect((await reader.load('a', new AbortController().signal)).orders).toHaveLength(1);
+  expect(start).toHaveBeenCalledOnce();
+});
+it('manual refresh reuses an open profile and shop tab', async () => {
+  const { reader, start, newPage, shopPage } = browserFixture(orders, false, true);
+  await reader.load('a', new AbortController().signal);
+  expect(start).not.toHaveBeenCalled(); expect(newPage).not.toHaveBeenCalled();
+  expect(shopPage.goto).not.toHaveBeenCalled(); expect(shopPage.bringToFront).not.toHaveBeenCalled();
+});
+it('does not try to start a profile after an API authorization error', async () => {
+  const { reader, active, start } = browserFixture(orders, false, true);
+  active.mockRejectedValueOnce(new UserFacingError('Перевірте API-ключ'));
+  await expect(reader.load('a', new AbortController().signal)).rejects.toThrow('API-ключ');
+  expect(start).not.toHaveBeenCalled();
+});
+it('does not launch AdsPower during a background refresh', async () => {
+  const { reader, active, start } = browserFixture();
+  active.mockRejectedValueOnce(new AdsPowerConnectionError('Local API недоступний'));
+  await expect(reader.load('a', new AbortController().signal, ['cart'])).rejects.toThrow('Local API');
+  expect(start).not.toHaveBeenCalled();
+});
+it('respects a rate limit when opening a missing shop tab', async () => {
+  const { reader, pages, newPage, shopPage, paths, guard } = browserFixture(orders, false, true);
+  pages.pop(); newPage.mockResolvedValueOnce(shopPage);
+  shopPage.goto.mockResolvedValueOnce({ status: () => 429, headers: () => ({ 'retry-after': '60' }) });
+  await expect(reader.load('a', new AbortController().signal)).rejects.toThrow('429');
+  expect(guard.isBlocked()).toBe(true); expect(paths).toEqual([]);
+});
+it('does not start a profile if cancellation arrives during the active check', async () => {
+  const { reader, active, start } = browserFixture(orders, false, true);
+  const controller = new AbortController();
+  active.mockImplementationOnce(async () => { controller.abort(); throw new AdsPowerConnectionError('Local API'); });
+  await expect(reader.load('a', controller.signal)).rejects.toThrow('зупинено');
+  expect(start).not.toHaveBeenCalled();
 });

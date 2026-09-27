@@ -1,13 +1,15 @@
-import { chromium, type Browser, type Page, type Response } from 'playwright-core';
+import { type Browser, type Page, type Response } from 'patchright-core';
+import { connectProfile } from './connect';
 import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
 import { intersectBounds, responseOffsetBounds, type OffsetBounds } from '../core/clock-bounds';
 import type { BrowserProvider, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
+import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../core/pointer-motion';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
 import type { NbuLogin } from './nbu-login';
 import type { PageRecorder } from './page-recorder';
-import { assertShopPage, readNbuPage, readVisibleCartProductIds, waitForActionablePage } from './nbu-page';
+import { assertShopPage, BUY_BUTTON, clickBuyButton, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage } from './nbu-page';
 
 const startResponse = z.object({
   code: z.literal(0),
@@ -55,11 +57,30 @@ export function adsPowerFailure(code: number | undefined, message: string | unde
   return new UserFacingError(`AdsPower не зміг запустити профіль${Number.isInteger(code) ? ` (код ${code})` : ''}.`);
 }
 
+export class AdsPowerConnectionError extends UserFacingError {}
+
 export class AdsPowerClient {
   private readonly base: string;
   constructor(apiUrl: string, private readonly apiKey: string, private readonly request: typeof fetch = fetch,
-    private readonly startGate = new ProfileStartGate()) {
+    private readonly startGate = new ProfileStartGate(), private readonly launch?: () => Promise<void>) {
     this.base = localApiUrl(apiUrl);
+  }
+
+  // Opens AdsPower when its Local API is down and waits until the API answers.
+  private async launchAndWait(signal: AbortSignal): Promise<boolean> {
+    if (!this.launch) return false;
+    try { await this.launch(); } catch { return false; }
+    const until = Date.now() + 90_000;
+    while (Date.now() < until) {
+      signal.throwIfAborted();
+      try {
+        const response = await this.request(new URL('/status', this.base),
+          { signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]), redirect: 'error' });
+        if (response.ok) return true;
+      } catch { if (signal.aborted) throw signal.reason; }
+      await realClock.sleep(1000, signal);
+    }
+    return false;
   }
 
   async listProfiles(signal: AbortSignal): Promise<AdsProfile[]> {
@@ -87,7 +108,7 @@ export class AdsPowerClient {
     throw new Error('Список завеликий. Підтримується до 10 000 профілів.');
   }
 
-  // Query only: cabinet reads must never launch a profile or bring its window forward.
+  // Query only. Callers explicitly decide whether an inactive profile should be started.
   async active(profileId: string, signal: AbortSignal): Promise<string | undefined> {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profileId)) throw new Error('Invalid profile ID');
     await this.startGate.wait(signal);
@@ -106,10 +127,11 @@ export class AdsPowerClient {
       if (!result.success) throw new UserFacingError('AdsPower не надав стан профілю. Перевірте ID профілю та доступ до Local API.');
       if (result.data.data.status === 'Inactive') return undefined;
       if (!result.data.data.ws) throw new UserFacingError('AdsPower не надав адресу відкритого профілю.');
-      return validateCdpEndpoint(result.data.data.ws.puppeteer);
+      try { return validateCdpEndpoint(result.data.data.ws.puppeteer); }
+      catch { throw new UserFacingError('AdsPower повернув некоректну адресу браузера профілю.'); }
     } catch (error) {
       if (signal.aborted || error instanceof UserFacingError) throw error;
-      throw new UserFacingError('Не вдалося перевірити відкритий профіль. Перевірте AdsPower і Local API.');
+      throw new AdsPowerConnectionError('Не вдалося перевірити відкритий профіль. Перевірте AdsPower і Local API.');
     }
   }
 
@@ -122,13 +144,19 @@ export class AdsPowerClient {
     // Do not restore unrelated historical tabs or open the IP test page.
     url.searchParams.set('open_tabs', '1');
     url.searchParams.set('ip_tab', '0');
+    const send = () => this.request(url, {
+      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+      signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
+      redirect: 'error',
+    });
     let response: Awaited<ReturnType<typeof fetch>>; // not Playwright's Response, which is imported here
     try {
-      response = await this.request(url, {
-        headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
-        signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-        redirect: 'error',
-      });
+      try { response = await send(); }
+      catch (error) {
+        if (signal.aborted || (error instanceof Error && error.name === 'TimeoutError') ||
+            !await this.launchAndWait(signal)) throw error;
+        response = await send();
+      }
     } catch (error) {
       if (signal.aborted) throw error;
       throw new UserFacingError(error instanceof Error && error.name === 'TimeoutError'
@@ -282,7 +310,7 @@ export class AdsPowerProvider implements BrowserProvider {
       }
     };
     try {
-      try { browser = await chromium.connectOverCDP(endpoint, { timeout: 20_000 }); }
+      try { browser = await connectProfile(endpoint, 20_000); }
       catch (error) {
         if (signal.aborted) throw error;
         throw new UserFacingError('Не вдалося підключитися до браузера профілю. Закрийте профіль в AdsPower і спробуйте знову.');
@@ -358,6 +386,20 @@ export class AdsPowerProvider implements BrowserProvider {
           const check = () => { taskSignal.throwIfAborted(); };
           check();
           await page.bringToFront();
+          // Opened now, before the sale, so the click does not pay for it.
+          const cdp = await context.newCDPSession(page);
+          await prepareClickWorld(cdp).catch(() => {});
+          check();
+          const tempo = profileMotionTempo(profileId);
+          let pointer: { x: number; y: number } | undefined;
+          // Moves along a human-like path, stopping early (mid-path) when the time budget runs out.
+          const glide = async (to: { x: number; y: number }, view: { width: number; height: number }, until: number) => {
+            const from = pointer ?? { x: view.width * (0.3 + Math.random() * 0.4), y: view.height * (0.3 + Math.random() * 0.4) };
+            pointer = await glidePointer(pointerCurve(from, to, view.width, view.height, tempo), async (step) => {
+              check(); assertShopPage(page, target);
+              await page.mouse.move(step.x, step.y);
+            }, realClock, taskSignal, until);
+          };
           const recording = taskOptions?.capture && this.recorder?.forTask(taskOptions.capture.taskId, taskOptions.capture.saleAt);
           if (recording) {
             const handler = (response: Response) => recording.response(response);
@@ -389,6 +431,7 @@ export class AdsPowerProvider implements BrowserProvider {
               if (this.guard.isBlocked()) return; // The buyer will enter the shared recovery loop.
               const response = await reload(page);
               if (response) observeResponse(page, response);
+              void prepareClickWorld(cdp).catch(() => {}); // The reload destroyed the previous world.
               check(); // The buyer reads the fresh page next; a second read here only delays the click.
             },
             login: async () => {
@@ -399,6 +442,7 @@ export class AdsPowerProvider implements BrowserProvider {
               await this.guard.wait(taskSignal, deadline);
               const response = await reload(page);
               if (response) observeResponse(page, response);
+              void prepareClickWorld(cdp).catch(() => {});
               check();
               return true;
             },
@@ -406,10 +450,43 @@ export class AdsPowerProvider implements BrowserProvider {
               if (!recording || page.isClosed()) return;
               await recording.snapshot(page, request);
             },
-            clickBuy: async () => {
-              check(); this.guard.check(); assertShopPage(page, target); await page.evaluate(readNbuPage, true);
+            idle: async (ms) => {
+              const until = Date.now() + ms;
+              check(); assertShopPage(page, target);
+              const view = await page.evaluate(() => ({ width: innerWidth, height: innerHeight, visible: document.visibilityState === 'visible' }));
+              // Only the tab in front moves; a person holds one pointer. Often the hand simply rests.
+              if (!view.visible || Math.random() < 0.4) return;
+              await glide({ x: view.width * (0.1 + Math.random() * 0.8), y: view.height * (0.12 + Math.random() * 0.76) }, view, until);
             },
-            disconnect: async () => {}, // Batch owns the CDP connection until its last task.
+            approach: async (ms) => {
+              const until = Date.now() + ms;
+              check(); assertShopPage(page, target);
+              const box = await page.evaluate((selector) => {
+                const element = document.querySelector(selector) ?? document.querySelector('#r_buy_intovar');
+                const rect = element?.getBoundingClientRect();
+                return { width: innerWidth, height: innerHeight, rect: rect && rect.width && rect.height
+                  ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : undefined };
+              }, BUY_BUTTON);
+              if (!box.rect) return;
+              let { top } = box.rect;
+              // Scroll now, well before the sale, rather than at the moment of the click.
+              if ((top < 0 || top + box.rect.height > box.height) && Date.now() + 800 < until) {
+                const distance = top + box.rect.height / 2 - box.height / 2;
+                for (const delta of wheelSteps(distance)) {
+                  check(); await page.mouse.wheel(0, delta);
+                  await realClock.sleep(30 + Math.random() * 60, taskSignal);
+                }
+                await realClock.sleep(150, taskSignal);
+                top -= distance;
+              }
+              const spot = { x: box.rect.left + box.rect.width * (0.3 + Math.random() * 0.4), y: top + box.rect.height * (0.3 + Math.random() * 0.4) };
+              await glide(spot, box, until);
+            },
+            clickBuy: async () => {
+              check(); this.guard.check(); assertShopPage(page, target); return clickBuyButton(cdp, page);
+            },
+            // Batch owns the browser connection until its last task; only this task's channel closes.
+            disconnect: async () => { await cdp.detach().catch(() => {}); },
           };
         },
         disconnect: async () => {

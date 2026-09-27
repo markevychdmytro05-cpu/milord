@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { chromium, type Browser, type Page } from 'playwright-core';
+import { type Browser, type Page } from 'patchright-core';
+import { connectProfile } from './connect';
 import type { CabinetOrderDetails, CabinetOrdersPage, CabinetSection, CabinetSnapshot } from '../core/cabinet';
 import { ShopRateLimitError, ShopRequestGuard, UserFacingError } from '../core/shop-errors';
-import { AdsPowerClient, PreparationGate } from './adspower';
+import { AdsPowerClient, AdsPowerConnectionError, PreparationGate } from './adspower';
 import { readCabinetPage, type CabinetPageResult } from './cabinet-page';
 import type { NbuLogin } from './nbu-login';
 
@@ -24,7 +25,7 @@ class LoginRequiredError extends UserFacingError {}
 
 export class CabinetReader {
   constructor(private readonly client: AdsPowerClient, private readonly guard: ShopRequestGuard,
-    private readonly gate: PreparationGate, private readonly login?: NbuLogin) {}
+    private readonly gate: PreparationGate, private readonly login?: NbuLogin, private readonly openProfile = false) {}
 
   // Each section is one request to the shop; background refreshes ask for the cart only.
   load(profileId: string, signal: AbortSignal, sections: CabinetSection[] = ['orders', 'wishlist', 'cart']): Promise<CabinetSnapshot> {
@@ -90,16 +91,36 @@ export class CabinetReader {
     };
     try {
       checkGuard();
-      const endpoint = await this.client.active(profileId, signal);
-      if (!endpoint) throw new UserFacingError('Профіль закритий. Відкрийте його в AdsPower; кабінет сам не запускає браузер.');
+      let endpoint = await this.client.active(profileId, signal).catch(error => {
+        if (signal.aborted || !this.openProfile || !(error instanceof AdsPowerConnectionError)) throw error;
+        return undefined;
+      });
+      if (!endpoint && this.openProfile) endpoint = await this.client.start(profileId, signal);
+      if (!endpoint) throw new UserFacingError('Профіль закритий. Натисніть «Оновити кабінет», щоб запустити його.');
       signal.throwIfAborted();
-      browser = await chromium.connectOverCDP(endpoint, { timeout: 20_000 });
+      browser = await connectProfile(endpoint, 20_000);
       signal.throwIfAborted();
-      page = browser.contexts()[0]?.pages().find(candidate => {
+      const context = browser.contexts()[0];
+      if (!context) throw new UserFacingError('У профілі AdsPower немає відкритого вікна браузера.');
+      page = context.pages().find(candidate => {
         try { return !candidate.isClosed() && new URL(candidate.url()).origin === ORIGIN; } catch { return false; }
       });
-      if (!page) throw new UserFacingError('Відкрийте вкладку coins.bank.gov.ua у цьому профілі. Кабінет не відкриває вкладок автоматично.');
       signal.addEventListener('abort', abort, { once: true });
+      if (!page && this.openProfile) {
+        page = await context.newPage();
+        await this.gate.run(signal, () => this.readOnce(signal, async () => {
+          checkGuard();
+          const response = await page!.goto(`${ORIGIN}/`, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+          signal.throwIfAborted();
+          if (response?.status() === 429) {
+            this.guard.block(response.headers()['retry-after']);
+            throw new UserFacingError(messages['rate-limit']);
+          }
+          assertOrigin();
+          if (response && !response.ok()) throw new UserFacingError(`НБУ відповів помилкою (HTTP ${response.status()}).`);
+        }));
+      }
+      if (!page) throw new UserFacingError('Відкрийте вкладку НБУ або натисніть «Оновити кабінет».');
       const fetchPage = async (section: CabinetSection | 'detail', pageNumber = 1, orderId?: string, detailId = orderId) =>
         this.gate.run(signal, () => this.readOnce(signal, async () => {
           checkGuard(); assertOrigin();

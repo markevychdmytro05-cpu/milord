@@ -2,7 +2,7 @@ import { mkdtemp, readFile } from 'node:fs/promises';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { BrowserContext } from 'playwright-core';
+import type { BrowserContext } from 'patchright-core';
 import { describe, expect, it } from 'vitest';
 import { PreparationGate } from '../src/browser/adspower';
 import { LOGIN_RETRY_MS, NbuLogin, type NbuCredentials } from '../src/browser/nbu-login';

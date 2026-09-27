@@ -1,6 +1,6 @@
 // Selectors and state recognition adapted from nbu-store-speed-buyer (MIT).
 // Copyright (c) 2026 Mykhailo Toporkov. See third-party/nbu-store-speed-buyer/LICENSE.
-import type { Page } from 'playwright-core';
+import type { CDPSession, Page } from 'patchright-core';
 import type { PageState } from '../core/ports';
 
 export const BUY_BUTTON = 'form[name="cart_quantity"] #r_buy_intovar button[type="submit"].buy';
@@ -68,6 +68,78 @@ export function readNbuPage(click = false): PageState {
     button.click();
   }
   return state;
+}
+
+// Aims at the buy button with the same checks as readNbuPage(true), but does not click. Returns a probe
+// object that records whether the next click on the button came from the real mouse. Nothing is left on
+// the page: the probe lives only as a DevTools object reference, and the listener runs once.
+const aimExpression = () => `(() => {
+  const read = ${readNbuPage.toString()};
+  const state = read(false);
+  const button = document.querySelector(${JSON.stringify(BUY_BUTTON)});
+  if (!state.buyAvailable || state.login !== 'logged-in' || state.inCart || state.rateLimited || state.challenge ||
+      state.turnstile || state.purchasePending || state.queuePosition || !button) return { ready: false };
+  let box = button.getBoundingClientRect();
+  if (box.top < 0 || box.left < 0 || box.bottom > innerHeight || box.right > innerWidth) {
+    button.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    box = button.getBoundingClientRect();
+  }
+  // A slightly different spot each time, never at the very edge.
+  const x = box.left + box.width * (0.3 + Math.random() * 0.4), y = box.top + box.height * (0.3 + Math.random() * 0.4);
+  const hit = document.elementFromPoint(x, y);
+  const probe = { ready: true, aimed: !!hit && (hit === button || button.contains(hit)), x, y, trusted: false };
+  if (probe.aimed) button.addEventListener('click', (event) => { probe.trusted = event.isTrusted; }, { once: true, capture: true });
+  return probe;
+})()`;
+
+type Preview = { properties?: Array<{ name: string; value?: string }> };
+// Our own JavaScript world in the tab: it shares the DOM with the site but none of its globals or
+// prototypes, so the site can neither see nor intercept our code. A navigation destroys it; the
+// provider recreates it after each reload, off the click path.
+const worlds = new WeakMap<CDPSession, Promise<number>>();
+export function prepareClickWorld(cdp: CDPSession): Promise<number> {
+  const world = (async () => {
+    const { frameTree } = await cdp.send('Page.getFrameTree');
+    const { executionContextId } = await cdp.send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, grantUniveralAccess: true });
+    return executionContextId;
+  })();
+  worlds.set(cdp, world);
+  world.catch(() => { if (worlds.get(cdp) === world) worlds.delete(cdp); });
+  return world;
+}
+async function evaluateInWorld(cdp: CDPSession, expression: string) {
+  const run = async (contextId: number) => cdp.send('Runtime.evaluate', { expression, contextId, generatePreview: true });
+  try { return await run(await (worlds.get(cdp) ?? prepareClickWorld(cdp))); }
+  catch { return run(await prepareClickWorld(cdp)); } // The page navigated since the world was made.
+}
+// A real mouse click on the buy button: one DevTools round trip to aim, then move, press and release are
+// sent back to back without waiting on each other. Falls back to the DOM click if the mouse missed,
+// so a covered or zoomed button never costs the 11 s click cooldown.
+export async function clickBuyButton(cdp: CDPSession, page: Page): Promise<'mouse' | 'dom'> {
+  const { result } = await evaluateInWorld(cdp, aimExpression());
+  const fields = Object.fromEntries(((result.preview as Preview | undefined)?.properties ?? []).map((item) => [item.name, item.value]));
+  const release = () => { if (result.objectId) void cdp.send('Runtime.releaseObject', { objectId: result.objectId }).catch(() => {}); };
+  if (fields.ready !== 'true') { release(); throw new Error('Page state changed before purchase click'); }
+  if (fields.aimed === 'true') {
+    const x = Number(fields.x), y = Number(fields.y);
+    await Promise.all([
+      cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 }),
+      cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }),
+      cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }),
+    ]);
+    // Input events are acknowledged after the page handled them, so the listener has already run.
+    const check = await cdp.send('Runtime.callFunctionOn', { objectId: result.objectId,
+      functionDeclaration: 'function () { return this.trusted; }', returnByValue: true }).catch(() => undefined);
+    release();
+    if (check?.result.value === true) return 'mouse';
+  } else release();
+  try { await page.evaluate(readNbuPage, true); }
+  catch (error) {
+    // The page already reacted to the mouse (pending, queue or cart): that click counted.
+    if (fields.aimed === 'true' && error instanceof Error && error.message.includes('Page state changed')) return 'mouse';
+    throw error;
+  }
+  return 'dom';
 }
 
 export async function waitForActionablePage(page: Page, timeoutMs: number): Promise<PageState> {

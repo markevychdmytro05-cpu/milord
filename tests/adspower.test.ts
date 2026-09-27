@@ -82,6 +82,20 @@ describe('AdsPower Local API adapter', () => {
     expect((await failureOf(new AdsPowerClient('http://localhost:50325', '', broken).start('abc', new AbortController().signal))).message).toContain('HTTP 500');
   });
 
+  it('opens AdsPower when it is not running and retries the start', async () => {
+    const ws = 'ws://127.0.0.1:9222/devtools/browser/x';
+    let up = false;
+    const request = vi.fn<typeof fetch>(async (input) => {
+      if (!up) throw new TypeError('fetch failed ECONNREFUSED');
+      if (String(input).endsWith('/status')) return new Response(JSON.stringify({ code: 0 }));
+      return new Response(JSON.stringify({ code: 0, data: { ws: { puppeteer: ws } } }));
+    });
+    const launch = vi.fn(async () => { up = true; });
+    const client = new AdsPowerClient('http://localhost:50325', '', request, undefined, launch);
+    await expect(client.start('abc', new AbortController().signal)).resolves.toBe(ws);
+    expect(launch).toHaveBeenCalledOnce();
+  });
+
   it('does not report a cancelled start as an AdsPower problem', async () => {
     const cancelled = new AbortController(); cancelled.abort();
     const request = vi.fn<typeof fetch>().mockRejectedValue(new DOMException('aborted', 'AbortError'));

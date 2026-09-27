@@ -214,8 +214,19 @@ export async function runTask(
     await persist();
     check();
 
+    let pointerStarted = false, pointerParked = false;
+    // Pointer activity is cosmetic: it must never fail or delay the purchase.
+    const quietly = async (action: () => Promise<void>) => {
+      try { await action(); } catch (error) { if (signal.aborted) throw error; }
+    };
     while (startNow() < task.saleAt) {
       const remaining = task.saleAt - startNow();
+      // Park on the button a few seconds early, so the click itself is a short, still press.
+      if (remaining <= 3500 && remaining > 2000 && !pointerParked && session.approach) {
+        pointerParked = true;
+        await quietly(() => session!.approach!(remaining - 1200));
+        continue;
+      }
       if (remaining <= 1000) {
         // Reserve the last second for the deadline: no CDP reads or filesystem work.
         await wait(Math.min(50, remaining));
@@ -235,7 +246,14 @@ export async function runTask(
       } else {
         await update('waiting', 'Профіль готовий. Очікуємо початок продажу.');
       }
-      await wait(Math.min(1000, Math.max(1, task.saleAt - startNow() - 1000)));
+      const pause = Math.min(1000, Math.max(1, task.saleAt - startNow() - 1000));
+      if (session.idle && !pointerParked && task.saleAt - startNow() > 4000) {
+        if (!pointerStarted) { pointerStarted = true; record('Легкий рух миші під час очікування, без кліків і переходів.'); }
+        const started = clock.now();
+        await quietly(() => session!.idle!(pause));
+        const left = pause - (clock.now() - started);
+        if (left > 0) await wait(left);
+      } else await wait(pause);
     }
     check();
     // A challenge may have appeared during the final countdown. Recheck once at the
@@ -337,8 +355,8 @@ export async function runTask(
           await update('firing', `Спроба додати в кошик: ${task.clicks}/${MAX_CLICKS}.`);
           check();
           try {
-            await session.clickBuy();
-            record('Натискання виконано. Це ще не підтвердження кошика.', { watchUntil });
+            const method = await session.clickBuy();
+            record('Натискання виконано. Це ще не підтвердження кошика.', { watchUntil, ...(method ? { clickMethod: method } : {}) });
             capture(`click-${task.clicks}`, true);
           }
           catch (error) {
@@ -374,7 +392,7 @@ export async function runTask(
       : error instanceof ShopRateLimitError ? 'expired' : 'failed';
     // Provider errors are deliberately not persisted: they can contain a CDP URL or a token.
     task.note = error instanceof ShopRateLimitError
-      ? error.message + (task.clicks || observedPurchase ? ' Результат додавання невідомий — перевірте кошик.' : '')
+      ? error.message + (task.clicks || observedPurchase ? ' Результат додавання невідомий – перевірте кошик.' : '')
       : signal.aborted
       ? 'Зупинено. Уже надіслану дію не скасовано; перевірте кошик, якщо було натискання.'
       : error instanceof UserFacingError

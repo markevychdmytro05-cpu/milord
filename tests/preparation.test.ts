@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page, type Response } from 'playwright-core';
+import { chromium, type Browser, type Page, type Response } from 'patchright-core';
 import { afterEach, expect, it, vi } from 'vitest';
 import { AdsPowerClient, AdsPowerProvider, PreparationGate, responseClockOffset } from '../src/browser/adspower';
 import { ShopRequestGuard } from '../src/core/shop-errors';
@@ -37,7 +37,7 @@ function fixture(existing: string[] = [], replies: Array<{ status: number; retry
     };
   }
   const pages = existing.map(createPage);
-  const context = { pages: () => pages, newPage: vi.fn(async () => {
+  const context = { pages: () => pages, on: vi.fn(), newCDPSession: vi.fn(async () => ({ send: vi.fn(), detach: vi.fn(async () => {}) })), newPage: vi.fn(async () => {
     const page = createPage(); pages.push(page); return page as unknown as Page;
   }) };
   const close = vi.fn(async () => {});

@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { BehaviorTests } from '../src/main/behavior-tests';
-const result = { moves: 1, scrolls: 0, navigations: 0, durationMs: 1000, stopped: true };
+const result = { moves: 1, scrolls: 0, navigations: 0, pauses: 0, durationMs: 1000, stopped: true, login: 'logged-in' as const };
 it('runs different profiles simultaneously and stops all of them before creating a purchase', async () => {
   const tests = new BehaviorTests(), signals = new Map<string, AbortSignal>();
   const finish = new Map<string, () => void>();

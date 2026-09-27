@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { chromium } from 'playwright-core';
+import { chromium } from 'patchright-core';
 import { mkdtemp, readFile, rm, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,7 +42,7 @@ try {
     onRateLimit: async () => console.log('Offline fixture returned 429; waiting for automatic retry.') });
   const productPages = context.pages().filter((page) => urls.includes(page.url()));
   assert.equal(productPages.length, 2);
-  for (const page of productPages) assert.equal(await page.evaluate(() => window.clicks), 0);
+  for (const page of productPages) assert.equal(await page.evaluate(() => window.clicks, undefined, undefined, false), 0);
   assert.equal(requests.length, 3);
   const secondRequests = requests.filter((request) => request.url === urls[1]);
   assert.ok(secondRequests[1].at - secondRequests[0].at >= 30_000);
@@ -54,7 +54,7 @@ try {
     assert.equal(task.status, 'in_cart'); assert.equal(task.clicks, 1); assert.equal(task.reloads, 0);
   }
   assert.equal(requests.length, 3); // No new navigation or HEAD probes at handoff.
-  for (const page of productPages) assert.equal(await page.evaluate(() => window.clicks), 1);
+  for (const page of productPages) assert.equal(await page.evaluate(() => window.clicks, undefined, undefined, false), 1);
   console.log('PASS: both tabs prepared; automatic 429 retry after 30 s; one click per product; no handoff requests. Real store requests: 0.');
 } finally {
   await pool?.disconnect().catch(() => {});

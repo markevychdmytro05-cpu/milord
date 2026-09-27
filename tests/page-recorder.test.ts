@@ -1,7 +1,7 @@
 import { mkdtemp, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Page, Response } from 'playwright-core';
+import type { Page, Response } from 'patchright-core';
 import { describe, expect, it } from 'vitest';
 import { PageRecorder } from '../src/browser/page-recorder';
 import { runTask } from '../src/core/buyer';
