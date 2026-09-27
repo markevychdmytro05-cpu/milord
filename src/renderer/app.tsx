@@ -514,6 +514,14 @@ function App() {
     : offsetEntries.map(([id, s]) => `${profileName(id)}: ${s.lastMs > 0 ? '+' : ''}${s.lastMs} мс · ` +
       `середнє ${s.meanMs} мс · замірів ${s.count} · останній ${when(s.lastAt, now)}${s.anomaly ? ' · АНОМАЛІЯ' : ''}`).join('\n');
   const kyivClock = new Date(now).toLocaleTimeString('uk-UA', { timeZone: SALE_TIME_ZONE });
+  const sync = state?.clockSync;
+  const syncFresh = !!sync && now - sync.at <= 10 * 60_000;
+  const syncDot = !syncFresh ? 'idle' : Math.abs(sync!.offsetMs) >= 1000 ? 'bad' : Math.abs(sync!.offsetMs) >= 200 ? 'attention' : 'good';
+  const syncText = !sync ? '–' : Math.abs(sync.offsetMs) < 1 ? 'точний'
+    : `${sync.offsetMs > 0 ? 'відстає' : 'поспішає'} ${Math.abs(sync.offsetMs)} мс`;
+  const syncTitle = !sync ? 'Звірка з атомним часом (NTP) ще не вдалася. Перевірте інтернет.'
+    : `Годинник комп’ютера ${syncText} від атомного часу (±${sync.uncertaintyMs} мс, серверів: ${sync.servers}, ${when(sync.at, now)}). ` +
+      'Старт продажу рахується за атомним часом, тож похибка годинника комп’ютера на нього не впливає.';
   const preview = (() => {
     try {
       const t = parseKyivDateTime(saleAt);
@@ -537,6 +545,7 @@ function App() {
           <div className="sys-row"><Icon name="link" /><span>AdsPower API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
           <div className="sys-row"><Icon name="users" /><span>Профілі</span><span className="sys-val">{options.length}</span></div>
           <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val">{kyivClock}</span></div>
+          <div className="sys-row" title={syncTitle}><Icon name="clock" /><span>Годинник ПК</span><span className="sys-val"><i className={`dot ${syncDot}`} />{syncText}</span></div>
           <div className="sys-row" title={offsetTitle}><Icon name="sync" /><span>Зсув сервера</span><span className="sys-val"><i className={`dot ${offsetDot}`} />{offsetText}</span></div>
           <details className="diagnostic-details"><summary>Заміри за профілями</summary><p className="hint">{offsetTitle}</p></details>
           <div className="diagnostic-stats"><h3>Сьогодні</h3><p className="hint">Завдань: {todayStats.planned} · у кошику: {todayStats.cart} · помилок: {todayStats.errors}</p>

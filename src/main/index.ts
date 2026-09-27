@@ -20,6 +20,7 @@ import { AccountStore, nbuCredentialsSchema } from './account-store';
 import { NbuLogin } from '../browser/nbu-login';
 import { PageRecorder } from '../browser/page-recorder';
 import { launchAdsPower } from './adspower-launcher';
+import { AtomicClock } from './ntp';
 
 app.setName('NBU Desktop');
 // UI smoke tests use an isolated temporary directory, never the user's task history.
@@ -32,7 +33,7 @@ async function boot(): Promise<void> {
   const store = new Store(join(app.getPath('userData'), 'tasks.json'));
   try { await store.load(); }
   catch {
-    dialog.showErrorBox('Не вдалося відкрити завдання', 'Файл tasks.json пошкоджений або недоступний. Оригінал не змінено.');
+    dialog.showErrorBox('Не вдалося відкрити завдання', 'Файл tasks.json або папка tasks пошкоджені чи недоступні. Оригінали не змінено.');
     app.quit();
     return;
   }
@@ -90,10 +91,13 @@ async function boot(): Promise<void> {
   const capturesPath = join(app.getPath('userData'), 'captures');
   const recorder = new PageRecorder(capturesPath);
   void recorder.prune();
+  const atomicClock = new AtomicClock();
+  atomicClock.start();
   scheduler = new Scheduler(store,
     () => new AdsPowerProvider(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, recorder),
     notify, busy,
     (message) => dialog.showErrorBox('Планувальник зупинено', message),
+    () => atomicClock.current()?.offsetMs,
   );
 
   function handle(channel: string, handler: (input: unknown) => unknown) {
@@ -107,7 +111,7 @@ async function boot(): Promise<void> {
   handle('state', () => ({ tasks: store.tasks(), settings: store.settings(), hasApiKey: !!apiKey,
     savedApiKey, secretStorageAvailable: keyStore.available(), secretError,
     nbuAccounts: accountStore.emails(), accountsError,
-    offsetHistoryByProfile: summarizeOffsetHistoryByProfile(store.tasks()) }));
+    offsetHistoryByProfile: summarizeOffsetHistoryByProfile(store.tasks()), clockSync: atomicClock.last() }));
   const cabinetCache = new CabinetCache();
   const cabinetStore = new CabinetStore(join(app.getPath('userData'), 'cabinet-cache.json'));
   handle('restore-cabinet', input => {

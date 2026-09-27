@@ -7,7 +7,7 @@ function storage() {
   return { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); } };
 }
 function state(now: number): CabinetSavedState {
-  const schedule = new CabinetRefreshSchedule();
+  const schedule = new CabinetRefreshSchedule(undefined, () => 0.5);
   schedule.completed('a', now, false); schedule.completed('b', now, true); schedule.finishRound(now);
   return { details: {}, view: { ...defaultCabinetView }, snapshots: { a: { profileId: 'a', fetchedAt: now, orders: [{ id: '900', detailId: '123', date: '27.08.2026',
     status: 'Оплачено', total: 500, quantity: 2, tracking: '' }], cart: [], wishlist: [], errors: {}, nextOrdersPage: 2 } },

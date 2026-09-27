@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
-import { CabinetRefreshSchedule } from '../core/cabinet-refresh';
+import { autoRefreshTargets, CabinetRefreshSchedule } from '../core/cabinet-refresh';
 import type { SavedProfile } from '../core/model';
 import type { CabinetOrder, CabinetOrderDetails, CabinetProduct, CabinetSection, CabinetSnapshot } from '../core/cabinet';
 import { SALE_TIME_ZONE } from '../core/kyiv-time';
@@ -72,7 +72,10 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
 
   async function refresh(automatic = false) {
     const due = autoSchedule.current.due(scope.map(p => p.id), Date.now());
-    const targets = automatic ? eligible.filter(p => due.includes(p.id)) : eligible;
+    const dueEligible = due.filter(id => eligible.some(p => p.id === id));
+    const targets = automatic
+      ? autoRefreshTargets(dueEligible, id => !!snapshots[id]).map(id => eligible.find(p => p.id === id)!)
+      : eligible;
     if (!cacheReady || busy.current || !targets.length) return;
     busy.current = true;
     if (!automatic) setSelectedId(undefined);

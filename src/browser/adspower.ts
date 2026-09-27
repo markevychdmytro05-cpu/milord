@@ -3,7 +3,7 @@ import { connectProfile } from './connect';
 import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
 import { intersectBounds, responseOffsetBounds, type OffsetBounds } from '../core/clock-bounds';
-import type { BrowserProvider, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
+import type { BrowserProvider, PageState, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
 import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../core/pointer-motion';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
@@ -381,9 +381,21 @@ export class AdsPowerProvider implements BrowserProvider {
         connect: async (requestedProfile, url, taskSignal, taskOptions) => {
           if (disconnected || requestedProfile !== profileId) throw new Error('Prepared profile is unavailable');
           const target = productUrl(url);
-          const page = pages.get(target);
-          if (!page || page.isClosed()) throw new UserFacingError('Вкладку монети закрито. Не закривайте її до кінця завдання.');
           const check = () => { taskSignal.throwIfAborted(); };
+          let page = pages.get(target);
+          if (!page || page.isClosed()) {
+            if (!connection.isConnected()) throw new Error('Browser connection closed');
+            // The coin's tab was closed or crashed: open it again rather than give up the sale.
+            const fresh = await context.newPage();
+            fresh.setDefaultTimeout(5000);
+            fresh.setDefaultNavigationTimeout(20_000);
+            observe(fresh);
+            check();
+            const response = await goto(fresh, target);
+            if (response) observeResponse(fresh, response);
+            pages.set(target, fresh);
+            page = fresh;
+          }
           check();
           await page.bringToFront();
           // Opened now, before the sale, so the click does not pay for it.
@@ -406,20 +418,58 @@ export class AdsPowerProvider implements BrowserProvider {
             page.on('response', handler);
             listeners.push({ page, handler });
           }
+          // Under heavy load a read can land exactly while the document is being replaced, a reload can
+          // outlast its timeout, and a dropped connection leaves Chrome's own error page in the tab. None
+          // of these is a reason to give up the sale: the buyer sees "no button yet" and reloads on schedule.
+          const errorPage = () => page.url().startsWith('chrome-error://');
+          const onTarget = () => { if (!errorPage()) assertShopPage(page, target); };
+          const transient = (error: unknown) => !taskSignal.aborted && error instanceof Error &&
+            /Execution context was destroyed|Cannot find context|navigat|Timeout|net::ERR_|frame was detached/i.test(error.message);
+          // A request the shop never answers keeps the tab "loading": a page read then waits for a document
+          // that never arrives. Stopping the load returns the tab to the page it had, so the buyer can read it
+          // and reload on schedule. The stop is a DevTools command that needs no page script.
+          const stopLoading = () => cdp.send('Page.stopLoading').then(() => {}, () => {});
+          const READ_WATCHDOG_MS = 4000;
+          const stalled = Symbol('stalled');
+          const watched = async <T>(action: () => Promise<T>): Promise<T | typeof stalled> => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              return await Promise.race([action(), new Promise<typeof stalled>((resolve) => { timer = setTimeout(() => resolve(stalled), READ_WATCHDOG_MS); })]);
+            } finally { clearTimeout(timer); }
+          };
+          // What the buyer sees when the tab has no readable page: no shop page, no button. Never a click.
+          const unreadable = (): PageState => ({ login: 'unknown', challenge: false, rateLimited: this.guard.isBlocked(), turnstile: false,
+            buyAvailable: false, purchasePending: false, inCart: false, queuePosition: '', sharedRateLimit: this.guard.isBlocked(),
+            navigationHttpStatus: navigationStatuses.get(page) });
+          const settled = async (action: () => Promise<PageState>): Promise<PageState> => {
+            for (let attempt = 0; attempt < 2; attempt++) {
+              try {
+                const state = await watched(action);
+                if (state !== stalled) return state;
+                await stopLoading();
+              } catch (error) {
+                if (!transient(error)) throw error;
+                await page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(stopLoading);
+              }
+            }
+            return unreadable();
+          };
+          // Slow but working answers must still get through: each timeout in a row allows 5 s more.
+          let reloadTimeouts = 0;
           // Handoff reuses the prepared tab: no AdsPower start, new tab or goto.
           return {
             prepared: true,
             read: async () => {
-              check(); const state = await readState(page); check(); assertShopPage(page, target); return state;
+              check(); const state = await settled(() => readState(page)); check(); onTarget(); return state;
             },
             recoverRateLimit: async (until) => {
               check(); assertShopPage(page, target); return recover(page, taskSignal, until);
             },
             waitForActionable: async (timeoutMs) => {
-              check(); assertShopPage(page, target);
-              const state = await waitForActionablePage(page, Math.min(1000, timeoutMs));
+              check(); onTarget();
+              const state = await settled(() => waitForActionablePage(page, Math.min(1000, timeoutMs)));
               if (state.rateLimited && !this.guard.isBlocked()) this.guard.block();
-              check(); assertShopPage(page, target);
+              check(); onTarget();
               return { ...state, navigationHttpStatus: navigationStatuses.get(page), sharedRateLimit: this.guard.isBlocked(),
                 rateLimited: state.rateLimited || this.guard.isBlocked() };
             },
@@ -427,10 +477,21 @@ export class AdsPowerProvider implements BrowserProvider {
             serverOffset: async () => { check(); return offsets.get(page) ?? 0; },
             serverOffsetBounds: async () => { check(); return offsetBounds.get(page); },
             reload: async () => {
-              check(); assertShopPage(page, target);
+              check(); onTarget();
               if (this.guard.isBlocked()) return; // The buyer will enter the shared recovery loop.
-              const response = await reload(page);
-              if (response) observeResponse(page, response);
+              const timeout = Math.min(25_000, 10_000 + reloadTimeouts * 5000);
+              try {
+                // Chrome's error page cannot be reloaded into the shop: open the coin's address again.
+                navigationSentAt.set(page, Date.now());
+                const response = errorPage() ? await page.goto(target, { waitUntil: 'domcontentloaded', timeout })
+                  : await page.reload({ waitUntil: 'domcontentloaded', timeout });
+                if (response) { observeResponse(page, response); navigationStatuses.set(page, response.status()); }
+                reloadTimeouts = 0;
+              } catch (error) {
+                if (!transient(error)) throw error;
+                if (error instanceof Error && /Timeout/i.test(error.message)) { reloadTimeouts++; await stopLoading(); }
+                navigationStatuses.delete(page); // Unanswered or dropped: no status to report.
+              }
               void prepareClickWorld(cdp).catch(() => {}); // The reload destroyed the previous world.
               check(); // The buyer reads the fresh page next; a second read here only delays the click.
             },
@@ -489,6 +550,7 @@ export class AdsPowerProvider implements BrowserProvider {
             disconnect: async () => { await cdp.detach().catch(() => {}); },
           };
         },
+        alive: () => !disconnected && connection.isConnected(),
         disconnect: async () => {
           if (disconnected) return;
           disconnected = true;

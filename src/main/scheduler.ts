@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { runTask } from '../core/buyer';
 import { priorOffsetBounds } from '../core/clock-bounds';
 import { isFinal, productUrl, taskInputSchema, type Task, type TaskInput } from '../core/model';
 import { realClock, type BrowserProvider, type PreparedProfile } from '../core/ports';
 import { UserFacingError } from '../core/shop-errors';
+import { CONNECTION_LOST_NOTE } from '../core/task-journal';
+
+const RECONNECT_NOTE = 'Зв’язок із браузером втрачено до кліку. Перепідключення до профілю.';
 import { Store } from './store';
 
 export function tasksOverlap(a: TaskInput, b: TaskInput): boolean {
@@ -11,6 +15,9 @@ export function tasksOverlap(a: TaskInput, b: TaskInput): boolean {
   const end = (task: TaskInput) => task.saleAt + task.windowMin * 60_000 + 120_000;
   return a.profileId === b.profileId && start(a) < end(b) && start(b) < end(a);
 }
+
+const INSPECT_TIMEOUT_MS = 120_000;
+export const UNEXPECTED_TASK_NOTE = 'Внутрішня помилка завдання. Перевірте кошик вручну; автоматичного повтору немає.';
 
 export class Scheduler {
   private running = new Map<string, { controller: AbortController; done: Promise<void>; profileId: string; batchId?: string }>();
@@ -28,6 +35,8 @@ export class Scheduler {
     private readonly onTask: (task: Task) => void,
     private readonly onBusy: (busy: boolean) => void,
     private readonly onError: (message: string) => void,
+    // UTC minus the local clock from SNTP, when a fresh reading exists.
+    private readonly atomicOffset: () => number | undefined = () => undefined,
   ) {}
 
   start(): void {
@@ -138,29 +147,42 @@ export class Scheduler {
     });
   }
 
-  async inspect(profileId: string, url: string): Promise<string> {
-    if (this.inspecting.has(profileId) || this.store.tasks().some((task) =>
+  // Bounded like readProfile: a hung AdsPower start or a long 429 wait must not hold the profile
+  // (and block new tasks for it) indefinitely, and quitting the app aborts it.
+  inspect(profileId: string, url: string, timeoutMs = INSPECT_TIMEOUT_MS): Promise<string> {
+    if (this.stopped || this.inspecting.has(profileId) || this.store.tasks().some((task) =>
       task.profileId === profileId && !isFinal(task.status))) {
-      throw new Error('Спочатку завершіть або скасуйте активні завдання цього профілю.');
+      return Promise.reject(new Error('Спочатку завершіть або скасуйте активні завдання цього профілю.'));
     }
     this.inspecting.add(profileId);
     this.onBusy(true);
-    let session;
-    try {
-      session = await this.provider().connect(profileId, url, new AbortController().signal);
-      const state = await session.read();
-      if (state.challenge || state.turnstile) return 'Профіль відкрито. Завершіть перевірку сайту у браузері.';
-      if (state.login !== 'logged-in') return 'Профіль відкрито. Увійдіть в акаунт НБУ у браузері.';
-      return state.inCart ? 'Підключення працює. Товар уже в кошику.' : 'Підключення працює. Вхід в акаунт підтверджено.';
-    } catch (error) {
-      // Rethrown as a plain Error so the IPC layer does not prefix the class name.
-      if (error instanceof UserFacingError) throw new Error(error.message);
-      throw new Error('Не вдалося перевірити профіль. Перевірте API, ключ, ID профілю та закрийте зайві вкладки НБУ.');
-    } finally {
-      await session?.disconnect().catch(() => {});
-      this.inspecting.delete(profileId);
-      this.onBusy(this.hasActiveWork());
-    }
+    const controller = new AbortController();
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const signal = AbortSignal.any([controller.signal, timeout]);
+    const done = (async () => {
+      let session;
+      try {
+        session = await this.provider().connect(profileId, url, signal);
+        signal.throwIfAborted();
+        const state = await session.read();
+        if (state.challenge || state.turnstile) return 'Профіль відкрито. Завершіть перевірку сайту у браузері.';
+        if (state.login !== 'logged-in') return 'Профіль відкрито. Увійдіть в акаунт НБУ у браузері.';
+        return state.inCart ? 'Підключення працює. Товар уже в кошику.' : 'Підключення працює. Вхід в акаунт підтверджено.';
+      } catch (error) {
+        if (timeout.aborted) throw new Error(`Перевірка профілю не завершилася за ${Math.round(timeoutMs / 60_000)} хв. Перевірте AdsPower і спробуйте ще раз.`);
+        if (signal.aborted) throw new Error('Перевірку профілю зупинено.');
+        // Rethrown as a plain Error so the IPC layer does not prefix the class name.
+        if (error instanceof UserFacingError) throw new Error(error.message);
+        throw new Error('Не вдалося перевірити профіль. Перевірте API, ключ, ID профілю та закрийте зайві вкладки НБУ.');
+      } finally {
+        await session?.disconnect().catch(() => {});
+        this.profileReads.delete(profileId);
+        this.inspecting.delete(profileId);
+        this.onBusy(this.hasActiveWork());
+      }
+    })();
+    this.profileReads.set(profileId, { controller, done });
+    return done;
   }
 
   readProfile<T>(profileId: string, action: (signal: AbortSignal) => Promise<T>, timeoutMs = 90_000): Promise<T> {
@@ -206,6 +228,8 @@ export class Scheduler {
           [...this.running.values()].some((active) => active.profileId === task.profileId &&
             (!task.batchId || active.batchId !== task.batchId))) continue;
       const controller = new AbortController();
+      const startedAt = Date.now();
+      let diskFailed = false;
       const done = Promise.resolve().then(async () => {
         const provider = this.provider();
         const pooled: BrowserProvider = {
@@ -239,10 +263,17 @@ export class Scheduler {
           },
         };
         await runTask(task, pooled, realClock, controller.signal, async (next) => {
-          await this.store.saveTask(next);
+          try { await this.store.saveTask(next); }
+          catch (error) {
+            // Invalid task data concerns this task only; a failed disk write concerns every task.
+            if (!(error instanceof z.ZodError)) diskFailed = true;
+            throw error;
+          }
           this.onTask(next);
-        }, () => priorOffsetBounds(this.store.tasks(), task.profileId, Date.now(), task.id));
-      }).catch(() => {
+        }, () => priorOffsetBounds(this.store.tasks(), task.profileId, Date.now(), task.id), this.atomicOffset);
+        await this.reconnectIfLost(task.id, startedAt);
+      }).catch(async () => {
+        if (!diskFailed && await this.finishUnexpected(task.id)) return;
         // Stop all scheduling on a persistence failure: a click must not happen without its journal entry.
         clearInterval(this.timer);
         this.stopped = true;
@@ -266,6 +297,48 @@ export class Scheduler {
       this.running.set(task.id, { controller, done, profileId: task.profileId, batchId: task.batchId });
     }
     this.onBusy(this.hasActiveWork());
+  }
+
+  // The connection to the profile's browser dropped before any click (a crashed tab, AdsPower hiccup):
+  // the task goes back to the queue and the next tick prepares the profile afresh. Never after a click
+  // or an observed purchase (those end as 'interrupted', not 'failed'), at most three times, and only
+  // while the sale window is still open.
+  private async reconnectIfLost(id: string, startedAt: number): Promise<void> {
+    const saved = this.store.tasks().find((item) => item.id === id);
+    if (!saved || saved.status !== 'failed' || saved.clicks > 0 || this.stopped) return;
+    if (!saved.events.some((event) => event.at >= startedAt && event.message === CONNECTION_LOST_NOTE)) return;
+    const attempts = saved.events.filter((event) => event.message.startsWith(RECONNECT_NOTE)).length;
+    if (attempts >= 3 || Date.now() + saved.offsetMs >= saved.saleAt + saved.windowMin * 60_000 - 10_000) return;
+    if (saved.batchId) {
+      const key = JSON.stringify([saved.batchId, saved.profileId]);
+      const entry = this.prepared.get(key);
+      // A dead browser connection is dropped; a live one reopens a closed tab by itself.
+      if (entry && await entry.promise.then((pool) => pool.alive?.() === false, () => true)) {
+        this.prepared.delete(key);
+        entry.controller.abort();
+        await entry.promise.then((pool) => pool.disconnect()).catch(() => {});
+      }
+    }
+    const note = `${RECONNECT_NOTE} Спроба ${attempts + 1}/3.`;
+    const next: Task = { ...saved, status: 'scheduled', note, updatedAt: Date.now(),
+      events: [...saved.events, { at: Date.now(), message: note, details: { status: 'scheduled' } }].slice(-200) };
+    await this.store.saveTask(next);
+    this.onTask(next);
+  }
+
+  // A task that escaped runTask without a disk failure ends on its own; other tasks keep running.
+  // Its last saved copy is used: a click is always saved before it is sent, so `clicks` is reliable.
+  private async finishUnexpected(id: string): Promise<boolean> {
+    const saved = this.store.tasks().find((item) => item.id === id);
+    if (!saved) return true;
+    if (isFinal(saved.status)) { this.onTask(saved); return true; }
+    const now = Date.now();
+    const finished: Task = { ...saved, status: saved.clicks ? 'interrupted' : 'failed', note: UNEXPECTED_TASK_NOTE, updatedAt: now,
+      events: [...saved.events, { at: now, message: UNEXPECTED_TASK_NOTE }].slice(-200) };
+    try { await this.store.saveTask(finished); }
+    catch { return false; }
+    this.onTask(finished);
+    return true;
   }
 
   private async waitForPool(promise: Promise<PreparedProfile>, signal: AbortSignal): Promise<PreparedProfile> {

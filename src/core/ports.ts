@@ -52,6 +52,8 @@ export interface BrowserProvider {
 
 export interface PreparedProfile extends BrowserProvider {
   disconnect(): Promise<void>;
+  // False once the connection to the profile's browser is gone and a fresh preparation is needed.
+  alive?(): boolean;
 }
 
 export interface Clock {

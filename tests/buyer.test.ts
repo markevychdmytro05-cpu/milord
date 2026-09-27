@@ -1,8 +1,10 @@
-import { describe, expect, it } from 'vitest';
-import { runTask, reloadIntervalMs, CLICK_COOLDOWN_MS, MAX_CLICKS } from '../src/core/buyer';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { runTask, reloadIntervalMs, jitterMs, CLICK_COOLDOWN_MS, MAX_CLICKS, SALE_START_MARGIN_MS } from '../src/core/buyer';
 import { fakeBrowser, FakeClock, ready, task } from './helpers';
 
 describe('purchase workflow', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
   it('observes a sale without clicking the button', async () => {
     const clock = new FakeClock();
     const browser = fakeBrowser(clock);
@@ -152,6 +154,7 @@ describe('purchase workflow', () => {
   });
 
   it('refreshes fast while the sale opens, then backs off after each completed load', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
     const clock = new FakeClock();
     const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: false }));
     const reload = browser.session.reload;
@@ -163,9 +166,9 @@ describe('purchase workflow', () => {
       const loadedAt = browser.reloads[i - 1]! + 250;
       expect(browser.reloads[i]! - loadedAt).toBe(reloadIntervalMs(loadedAt - 1_010_000, 1));
     }
-    expect(browser.reloads.slice(0, 3)).toEqual([1_010_000, 1_010_950, 1_011_900]);
-    // The old fixed 1 s cadence made ~240 full reloads here.
-    expect(browser.reloads.length).toBeLessThan(60);
+    expect(browser.reloads.slice(0, 3)).toEqual([1_010_000, 1_010_450, 1_010_900]);
+    // The old fixed 1 s cadence made ~240 full reloads here. The 200 ms opening burst adds ~10 in its first 5 s.
+    expect(browser.reloads.length).toBeLessThan(70);
   });
 
   it('expires without clicking if the machine wakes after the sale window', async () => {
@@ -383,10 +386,10 @@ it('recovers when another tab reports 429 between persisted intent and the actua
 });
 
 describe('reload interval', () => {
-  it('uses 700 ms for the first five seconds, then backs off', () => {
+  it('uses 200 ms for the first five seconds, then backs off', () => {
     expect([0, 4_999, 5_000, 19_999, 20_000, 59_999, 60_000, 119_999, 120_000, 299_000]
       .map((elapsed) => reloadIntervalMs(elapsed, 1)))
-      .toEqual([700, 700, 1000, 1000, 3000, 3000, 5000, 5000, 10_000, 10_000]);
+      .toEqual([200, 200, 1000, 1000, 3000, 3000, 5000, 5000, 10_000, 10_000]);
   });
 
   it('never shortens a slower interval the user chose', () => {
@@ -394,6 +397,12 @@ describe('reload interval', () => {
     expect(reloadIntervalMs(30_000, 5)).toBe(5000);
     expect(reloadIntervalMs(200_000, 5)).toBe(10_000);
     expect(reloadIntervalMs(200_000, 30)).toBe(30_000);
+  });
+
+  it('spreads each interval by at most 10%', () => {
+    expect(jitterMs(1000, () => 0)).toBe(900);
+    expect(jitterMs(1000, () => 0.5)).toBe(1000);
+    expect(jitterMs(1000, () => 0.999999)).toBe(1100);
   });
 });
 
@@ -426,5 +435,36 @@ describe('pointer before the sale', () => {
     await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
     expect(input.status).toBe('in_cart');
     expect(browser.clicks).toHaveLength(1);
+  });
+});
+
+describe('sale start by atomic time', () => {
+  const run = async (atomic: number | undefined, bounds = { lowMs: -500, highMs: 500 }) => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: browser.reloads.length > 0, inCart: browser.clicks.length > 0 }));
+    browser.session.serverOffsetBounds = async () => bounds;
+    const input = task({ saleAt: clock.time + 30_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {}, () => [], () => atomic);
+    return { input, firstReload: browser.reloads[0]! };
+  };
+  it('fires the first refresh 40 ms after the start by atomic time when the local clock is fast', async () => {
+    // Local clock 300 ms ahead of UTC: the refresh waits for true UTC, plus the safety margin.
+    const { input, firstReload } = await run(-300);
+    expect(input.offsetMs).toBe(-300);
+    expect(firstReload + input.offsetMs).toBeGreaterThanOrEqual(input.saleAt + SALE_START_MARGIN_MS);
+    expect(firstReload + input.offsetMs).toBeLessThan(input.saleAt + SALE_START_MARGIN_MS + 60);
+  });
+  it('corrects a slow local clock only to atomic time plus the margin', async () => {
+    const { input, firstReload } = await run(120);
+    expect(firstReload + 120).toBeGreaterThanOrEqual(input.saleAt + SALE_START_MARGIN_MS);
+    expect(firstReload + 120).toBeLessThan(input.saleAt + SALE_START_MARGIN_MS + 60);
+  });
+  it('keeps the conservative local rule without atomic time, or when the shop contradicts it', async () => {
+    const plain = await run(undefined);
+    expect(plain.firstReload).toBeGreaterThanOrEqual(plain.input.saleAt);
+    // The shop proves its clock is at least 200 ms ahead; an atomic reading of 0 disagrees and is not trusted.
+    const contradicted = await run(0, { lowMs: 200, highMs: 900 });
+    expect(contradicted.input.offsetMs).toBe(200);
+    expect(contradicted.firstReload).toBeGreaterThanOrEqual(contradicted.input.saleAt);
   });
 });

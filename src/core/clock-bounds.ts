@@ -34,10 +34,10 @@ export function intersectBounds(newestFirst: OffsetBounds[]): OffsetBounds | und
   return result;
 }
 
-// Trust the NTP-synced local clock unless the measurements prove it is off, and then correct by
-// exactly the proven amount. A range containing zero therefore yields 0, not a truncated guess.
-export function offsetFromBounds(bounds: OffsetBounds): number {
-  return Math.min(bounds.highMs, Math.max(bounds.lowMs, 0));
+// Trust the local clock, or its measured distance from atomic time when known (`preferredMs`), unless
+// the shop's own responses prove otherwise, and then correct by exactly the proven amount.
+export function offsetFromBounds(bounds: OffsetBounds, preferredMs = 0): number {
+  return Math.min(bounds.highMs, Math.max(bounds.lowMs, preferredMs));
 }
 
 // Same profile only: a different proxy may reach a different edge server with its own clock.

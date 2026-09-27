@@ -2,7 +2,8 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
-import { Scheduler } from '../src/main/scheduler';
+import { Scheduler, UNEXPECTED_TASK_NOTE } from '../src/main/scheduler';
+import { z } from 'zod';
 import { Store } from '../src/main/store';
 import { task } from './helpers';
 import type { PreparationOptions } from '../src/core/ports';
@@ -75,7 +76,7 @@ it('starts another coin in the same profile before the first coin finishes', asy
     expect(store.tasks().find((t) => t.profileId === 'a' && t.url.endsWith('one.html'))?.status).toBe('preparing');
     release();
     await vi.waitFor(() => expect(store.tasks().every((task) => task.status === 'in_cart')).toBe(true));
-    expect(calls.filter((call) => call.startsWith('a:'))).toEqual(['a:one.html', 'a:two.html']);
+    expect(calls.filter((call) => call.startsWith('a:')).sort()).toEqual(['a:one.html', 'a:two.html']);
   } finally { release(); await scheduler.stop(); }
 });
 
@@ -128,7 +129,9 @@ it('prepares all batch URLs before the first coin and reuses one pool through co
       url: `https://coins.bank.gov.ua/${coin}.html` })));
     await vi.waitFor(() => expect(disconnect).toHaveBeenCalledTimes(1));
     expect(store.tasks().map((task) => task.status)).toEqual(['in_cart', 'in_cart']);
-    expect(order).toEqual(['prepared', 'https://coins.bank.gov.ua/one.html', 'https://coins.bank.gov.ua/two.html']);
+    // Coins no longer share a disk queue, so their hand-off order is free; both follow the preparation.
+    expect(order[0]).toBe('prepared');
+    expect(order.slice(1).sort()).toEqual(['https://coins.bank.gov.ua/one.html', 'https://coins.bank.gov.ua/two.html']);
     expect(provider.prepare).toHaveBeenCalledTimes(1); expect(provider.connect).not.toHaveBeenCalled();
   } finally { await scheduler.stop(); }
 });
@@ -229,4 +232,105 @@ it('interrupts a long profile test when a previously scheduled purchase reaches 
     expect(await test).toBe('stopped');
     await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledOnce());
   } finally { await scheduler.stop(); vi.useRealTimers(); }
+});
+
+it('bounds a profile check with a timeout and releases the profile afterwards', async () => {
+  const { scheduler, store, signals } = await setup();
+  try {
+    await expect(scheduler.inspect('slow', 'https://coins.bank.gov.ua/p-1.html', 50)).rejects.toThrow('не завершилася');
+    expect(signals.get('slow')!.aborted).toBe(true);
+    await scheduler.add(task({ profileId: 'slow', saleAt: Date.now() + 86_400_000 }));
+    expect(store.tasks()).toHaveLength(1);
+  } finally { await scheduler.stop(); }
+});
+it('aborts a running profile check when the scheduler stops', async () => {
+  const { scheduler, signals } = await setup();
+  const check = scheduler.inspect('p', 'https://coins.bank.gov.ua/p-1.html');
+  const outcome = expect(check).rejects.toThrow('зупинено');
+  await vi.waitFor(() => expect(signals.get('p')).toBeDefined());
+  await scheduler.stop();
+  await outcome;
+  expect(signals.get('p')!.aborted).toBe(true);
+});
+
+it('ends only the broken task on a non-disk failure and keeps scheduling others', async () => {
+  const { store, scheduler, provider } = await setup();
+  const onError = vi.fn();
+  const guarded = new Scheduler(store, () => provider, () => {}, () => {}, onError);
+  await scheduler.stop();
+  const saveTask = store.saveTask.bind(store);
+  vi.spyOn(store, 'saveTask').mockImplementation(async (next) => {
+    if (next.profileId === 'broken' && next.note !== UNEXPECTED_TASK_NOTE) throw new z.ZodError([]);
+    return saveTask(next);
+  });
+  try {
+    const saleAt = Date.now() + 60_000;
+    await guarded.addMany(['broken', 'healthy'].map((profileId) => task({ profileId, saleAt })));
+    guarded.start();
+    await vi.waitFor(() => expect(store.tasks().find((item) => item.profileId === 'broken')!.status).toBe('failed'));
+    expect(store.tasks().find((item) => item.profileId === 'broken')!.note).toBe(UNEXPECTED_TASK_NOTE);
+    await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledWith('healthy', expect.anything(), expect.anything(), expect.anything()));
+    expect(onError).not.toHaveBeenCalled();
+    await guarded.add(task({ profileId: 'later', saleAt: Date.now() + 86_400_000 }));
+  } finally { await guarded.stop(); }
+});
+it('still stops everything when the task journal cannot be written to disk', async () => {
+  const { store, provider } = await setup();
+  const onError = vi.fn();
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, onError);
+  const saveTask = store.saveTask.bind(store);
+  vi.spyOn(store, 'saveTask').mockImplementation(async (next) => {
+    if (next.status !== 'scheduled') throw Object.assign(Error('disk full'), { code: 'ENOSPC' });
+    return saveTask(next);
+  });
+  try {
+    await scheduler.add(task({ saleAt: Date.now() + 60_000 }));
+    scheduler.start();
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(expect.stringContaining('Планувальник зупинено')));
+  } finally { await scheduler.stop(); }
+});
+
+it('reconnects a batch whose browser connection dropped before the click, and prepares it afresh', async () => {
+  const store = new Store(join(await mkdtemp(join(tmpdir(), 'nbu-reconnect-')), 'tasks.json'));
+  const { ready } = await import('./helpers');
+  let pools = 0;
+  const provider = { connect: vi.fn(), prepare: vi.fn(async () => {
+    const first = ++pools === 1;
+    return {
+      alive: () => !first, disconnect: vi.fn(async () => {}),
+      connect: vi.fn(async () => ({
+        read: async () => { if (first) throw new Error('Target page, context or browser has been closed'); return { ...ready, inCart: true }; },
+        waitForActionable: async () => ready, reload: async () => {}, serverOffset: async () => 0,
+        clickBuy: async () => {}, disconnect: async () => {},
+      })),
+    };
+  }) };
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
+  try {
+    await scheduler.addMany([task({ saleAt: Date.now() + 60_000 })]);
+    await vi.waitFor(() => expect(store.tasks()[0]!.status).toBe('in_cart'));
+    expect(provider.prepare).toHaveBeenCalledTimes(2);
+    expect(store.tasks()[0]!.events.some((event) => event.message.startsWith('Зв’язок із браузером втрачено до кліку'))).toBe(true);
+  } finally { await scheduler.stop(); }
+});
+
+it('gives up reconnecting after three attempts', async () => {
+  const store = new Store(join(await mkdtemp(join(tmpdir(), 'nbu-reconnect-limit-')), 'tasks.json'));
+  const { ready } = await import('./helpers');
+  const provider = { connect: vi.fn(), prepare: vi.fn(async () => ({
+    alive: () => false, disconnect: vi.fn(async () => {}),
+    connect: vi.fn(async () => ({
+      read: async () => { throw new Error('Target page, context or browser has been closed'); },
+      waitForActionable: async () => ready, reload: async () => {}, serverOffset: async () => 0,
+      clickBuy: async () => {}, disconnect: async () => {},
+    })),
+  })) };
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
+  try {
+    await scheduler.addMany([task({ saleAt: Date.now() + 60_000 })]);
+    await vi.waitFor(() => expect(provider.prepare).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(store.tasks()[0]!.status).toBe('failed'));
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(provider.prepare).toHaveBeenCalledTimes(4);
+  } finally { await scheduler.stop(); }
 });

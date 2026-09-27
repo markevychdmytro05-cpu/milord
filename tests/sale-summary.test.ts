@@ -1,6 +1,6 @@
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runTask } from '../src/core/buyer';
 import { summarizeSales } from '../src/core/sale-summary';
@@ -86,6 +86,7 @@ describe('history retention', () => {
     const restored = new Store(path);
     await restored.load();
     expect(restored.tasks().map(item => item.id)).toEqual([id(2)]);
-    expect(JSON.parse(await readFile(path, 'utf8')).tasks).toHaveLength(1);
+    expect(JSON.parse(await readFile(path, 'utf8')).taskIds).toEqual([id(2)]);
+    expect(await readdir(join(dirname(path), 'tasks'))).toEqual([`${id(2)}.json`]);
   });
 });

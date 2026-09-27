@@ -288,9 +288,10 @@ try {
   await page.getByRole('tab', { name: /^Історія/ }).press('ArrowLeft');
   assert.equal(await page.getByRole('tab', { name: /^Активні/ }).getAttribute('aria-selected'), 'true');
   await page.getByRole('tab', { name: /^Активні/ }).press('ArrowRight');
-  const persisted = await readFile(join(dataDirectory, 'tasks.json'), 'utf8');
-  assert.equal(persisted.includes(secret), false);
-  const saved = JSON.parse(persisted).tasks;
+  const index = JSON.parse(await readFile(join(dataDirectory, 'tasks.json'), 'utf8'));
+  const files = await Promise.all(index.taskIds.map((id) => readFile(join(dataDirectory, 'tasks', `${id}.json`), 'utf8')));
+  for (const persisted of [JSON.stringify(index), ...files]) assert.equal(persisted.includes(secret), false);
+  const saved = files.map((file) => JSON.parse(file));
   assert.equal(saved.length, 4);
   assert.equal(new Set(saved.map((task) => task.batchId)).size, 1);
   assert.equal(saved.filter((task) => task.profileId === 'profile_a').length, 2);
@@ -336,7 +337,7 @@ try {
   await restoredCabinet.getByRole('checkbox', { name: /Автооновлення/ }).uncheck();
   await page.getByRole('tab', { name: 'Налаштування', exact: true }).click();
   assert.equal(await page.getByRole('heading', { name: 'Діагностика' }).isVisible(), true);
-  assert.equal(await page.locator('.side .sys-row').count(), 4);
+  assert.equal(await page.locator('.side .sys-row').count(), 5); // API, profiles, Kyiv, PC clock vs atomic time, server offset
   // Saving a blank key keeps the existing encrypted key.
   await page.getByRole('button', { name: 'Зберегти налаштування', exact: true }).click();
   await page.getByText('Налаштування збережено.', { exact: true }).waitFor();

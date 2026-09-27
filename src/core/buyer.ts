@@ -9,6 +9,11 @@ import type { BrowserProvider, Clock, PageState, ShopSession } from './ports';
 export const CLICK_COOLDOWN_MS = 11_000;
 export const MAX_CLICKS = 5;
 export const WATCH_AFTER_CLICK_MS = 120_000;
+// With the clock verified against atomic time, the sale refresh fires this long after the start.
+// Measured: the shop's clock is within about ±60 ms of UTC and a request needs at least ~27 ms to
+// reach it, so the shop never receives the first refresh before its own start. An early refresh
+// costs far more (a page without the button, then a whole reload interval) than these 40 ms.
+export const SALE_START_MARGIN_MS = 40;
 
 type SaveTask = (task: Task) => Promise<void>;
 
@@ -18,15 +23,23 @@ type SaveTask = (task: Task) => Promise<void>;
 // A slower interval chosen by the user is never shortened after the opening burst.
 export function reloadIntervalMs(elapsedMs: number, retrySec: number): number {
   const base = Math.max(1, retrySec) * 1000;
-  if (elapsedMs < 5_000) return retrySec <= 1 ? 700 : base;
+  if (elapsedMs < 5_000) return retrySec <= 1 ? 200 : base;
   const tier = elapsedMs < 20_000 ? 1000 : elapsedMs < 60_000 ? 3000 : elapsedMs < 120_000 ? 5000 : 10_000;
   return Math.max(base, tier);
+}
+
+// A small spread so reloads do not tick at an exactly regular rhythm.
+export const RELOAD_JITTER = 0.1;
+export function jitterMs(ms: number, random = Math.random): number {
+  return Math.round(ms * (1 + (random() * 2 - 1) * RELOAD_JITTER));
 }
 
 export async function runTask(
   task: Task, provider: BrowserProvider, clock: Clock, signal: AbortSignal, save: SaveTask,
   // Read at measurement time, so tasks prepared together already see each other's readings.
   priorBounds: () => OffsetBounds[] = () => [],
+  // UTC minus the local clock from SNTP, when a fresh reading exists.
+  atomicOffset: () => number | undefined = () => undefined,
 ): Promise<void> {
   let session: ShopSession | undefined;
   let lastClickAt = 0;
@@ -78,9 +91,12 @@ export async function runTask(
   const check = () => signal.throwIfAborted();
   const serverNow = () => clock.now() + task.offsetMs;
   const saleDeadline = () => task.saleAt + task.windowMin * 60_000;
-  // Neither a positive estimate nor a fast local clock may advance the sale refresh.
-  const startNow = () => Math.min(clock.now(), serverNow());
-  const reloadInterval = () => reloadIntervalMs(startNow() - task.saleAt, task.retrySec);
+  // Neither a positive estimate nor a fast local clock may advance the sale refresh. Only a clock
+  // verified against atomic time, and consistent with the shop's own responses, is used as is.
+  let atomicStart = false;
+  const startNow = () => atomicStart ? serverNow() : Math.min(clock.now(), serverNow());
+  const startAt = () => task.saleAt + (atomicStart ? SALE_START_MARGIN_MS : 0);
+  const reloadInterval = () => jitterMs(reloadIntervalMs(startNow() - task.saleAt, task.retrySec));
 
   const update = async (status: TaskStatus, note: string) => {
     check();
@@ -159,6 +175,13 @@ export async function runTask(
     };
     const attentionNote = (state: PageState, fallback: string) =>
       state.login === 'logged-out' && loginFailure ? loginFailure : fallback;
+    // Not a shop page at all: an overloaded server's error page (502/503/504) or a cut-off load. It asks
+    // for no verification and no sign-in, so a person could do nothing either: the way forward is the
+    // next scheduled reload, never a pause for attention.
+    const notShopPage = (state: PageState) => state.login === 'unknown' && !state.buyAvailable && !state.challenge && !state.turnstile &&
+      !state.inCart && !state.purchasePending && !state.queuePosition;
+    const brokenNote = (state: PageState) => `НБУ віддав сторінку помилки${state.navigationHttpStatus && state.navigationHttpStatus >= 400
+      ? ` (HTTP ${state.navigationHttpStatus})` : ''}. Оновлюємо за розкладом.`;
 
     // Observe only while a verification/login/queue is active. No time probes or reloads.
     const waitUntilReady = async (): Promise<boolean> => {
@@ -179,6 +202,7 @@ export async function runTask(
           return false;
         }
         if (await tryLogin(state)) continue;
+        if (notShopPage(state) && !observedPurchase) { record(brokenNote(state)); readyToBuy = false; return true; }
         if (state.challenge || state.turnstile || state.login !== 'logged-in') {
           await update('needs_attention', attentionNote(state, 'Увійдіть в акаунт НБУ та завершіть перевірку браузера.'));
         } else if (state.queuePosition) {
@@ -200,12 +224,14 @@ export async function runTask(
       // This session's own range first: an older reading that disagrees with it is dropped.
       const prior = priorBounds();
       const combined = intersectBounds([bounds, ...prior])!;
+      const atomic = atomicOffset();
+      atomicStart = atomic !== undefined && atomic >= combined.lowMs && atomic <= combined.highMs;
       task.offsetLowMs = bounds.lowMs;
       task.offsetHighMs = bounds.highMs;
-      task.offsetMs = offsetFromBounds(combined);
+      task.offsetMs = offsetFromBounds(combined, atomic ?? 0);
       task.offsetSampledAt = clock.now();
       record('Оцінено різницю часу сервера й комп’ютера.', { offsetLowMs: combined.lowMs, offsetHighMs: combined.highMs,
-        priorSamples: prior.length });
+        priorSamples: prior.length, ...(atomic !== undefined ? { atomicOffsetMs: atomic, atomicStart } : {}) });
     } else {
       task.offsetMs = await session.serverOffset();
       task.offsetSampledAt = clock.now();
@@ -215,12 +241,13 @@ export async function runTask(
     check();
 
     let pointerStarted = false, pointerParked = false;
+    let brokenReloadAt = -Infinity;
     // Pointer activity is cosmetic: it must never fail or delay the purchase.
     const quietly = async (action: () => Promise<void>) => {
       try { await action(); } catch (error) { if (signal.aborted) throw error; }
     };
-    while (startNow() < task.saleAt) {
-      const remaining = task.saleAt - startNow();
+    while (startNow() < startAt()) {
+      const remaining = startAt() - startNow();
       // Park on the button a few seconds early, so the click itself is a short, still press.
       if (remaining <= 3500 && remaining > 2000 && !pointerParked && session.approach) {
         pointerParked = true;
@@ -237,7 +264,16 @@ export async function runTask(
       if (state.rateLimited) throw new ShopRateLimitError();
       observedPurchase ||= state.purchasePending;
       if (await tryLogin(state)) continue;
-      if (state.challenge || state.turnstile || state.login !== 'logged-in') {
+      if (notShopPage(state)) {
+        // Before the sale the shop is quiet: reload a failed page now, so sign-in and the clock are
+        // checked in time. Never in the last 10 s and at most every 30 s.
+        await update('waiting', brokenNote(state));
+        if (remaining > 10_000 && clock.now() - brokenReloadAt >= 30_000) {
+          brokenReloadAt = clock.now();
+          await session.reload();
+          continue;
+        }
+      } else if (state.challenge || state.turnstile || state.login !== 'logged-in') {
         await update('needs_attention', attentionNote(state, 'Увійдіть в акаунт НБУ та завершіть перевірку браузера.'));
       } else if (state.queuePosition) {
         await update('queued', `Черга: ${state.queuePosition}`);
@@ -246,8 +282,8 @@ export async function runTask(
       } else {
         await update('waiting', 'Профіль готовий. Очікуємо початок продажу.');
       }
-      const pause = Math.min(1000, Math.max(1, task.saleAt - startNow() - 1000));
-      if (session.idle && !pointerParked && task.saleAt - startNow() > 4000) {
+      const pause = Math.min(1000, Math.max(1, startAt() - startNow() - 1000));
+      if (session.idle && !pointerParked && startAt() - startNow() > 4000) {
         if (!pointerStarted) { pointerStarted = true; record('Легкий рух миші під час очікування, без кліків і переходів.'); }
         const started = clock.now();
         await quietly(() => session!.idle!(pause));
@@ -305,7 +341,8 @@ export async function runTask(
         return;
       }
       if (await tryLogin(state)) { detectImmediately = true; continue; }
-      if (state.challenge || state.turnstile || state.login !== 'logged-in') {
+      if (notShopPage(state) && !task.clicks) decision(brokenNote(state), state.navigationHttpStatus ? { httpStatus: state.navigationHttpStatus } : {});
+      else if (state.challenge || state.turnstile || state.login !== 'logged-in') {
         awaitingVerification = true;
         await update('needs_attention', state.login === 'logged-out'
           ? attentionNote(state, 'Потрібен вхід в акаунт НБУ.')

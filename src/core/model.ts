@@ -106,6 +106,8 @@ export interface AppState {
   nbuAccounts: Record<string, string>;
   accountsError?: string;
   offsetHistoryByProfile: Record<string, OffsetHistorySummary>;
+  // UTC minus this computer's clock, from SNTP; absent until the first reading.
+  clockSync?: { offsetMs: number; uncertaintyMs: number; at: number; servers: number };
 }
 
 export interface AdsProfile { id: string; name: string; number: string; }

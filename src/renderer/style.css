@@ -46,6 +46,7 @@ main { min-width: 0; padding: 0 28px 48px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.good { background: #24a465; }
 .dot.bad { background: var(--bad); }
+.dot.attention { background: var(--warn-line); }
 .stat { display: flex; align-items: center; gap: 12px; padding: 8px; margin-bottom: 8px; background: var(--panel); border: 1px solid var(--ink); }
 .stat-icon { display: grid; place-items: center; width: 34px; height: 34px; background: var(--ink); color: #fff; flex: none; }
 .stat-text { display: grid; }
