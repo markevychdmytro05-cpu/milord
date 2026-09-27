@@ -1,14 +1,9 @@
 import { createSocket } from 'node:dgram';
+import { isFreshClockSync, type ClockSync } from '../core/clock-sync';
+export type { ClockSync } from '../core/clock-sync';
 
 // Atomic time over SNTP (RFC 4330), no request to the shop. It tells how far this computer's clock
-// is from UTC, so a fast clock can never make the sale refresh fire before the shop opens.
-export interface ClockSync {
-  offsetMs: number;      // UTC minus this computer's clock
-  uncertaintyMs: number; // half the round trip of the best reply
-  at: number;            // local time of the measurement
-  servers: number;       // servers that agreed
-}
-
+// is from UTC; the buyer accounts for measurement uncertainty when scheduling the sale refresh.
 const SERVERS = ['time.apple.com', 'time.google.com', 'time.cloudflare.com', 'pool.ntp.org'];
 const NTP_EPOCH_OFFSET_S = 2_208_988_800;
 
@@ -51,14 +46,21 @@ export async function measureClock(timeoutMs = 2000, rounds = 3): Promise<ClockS
     }
     return chosen;
   }))).filter((reply): reply is { offsetMs: number; delayMs: number } => !!reply && reply.delayMs < 1000);
+  return summarizeClockReplies(best, Date.now());
+}
+
+export function summarizeClockReplies(best: { offsetMs: number; delayMs: number }[], at: number): ClockSync | undefined {
   if (!best.length) return undefined;
   const offsets = best.map((reply) => reply.offsetMs).sort((a, b) => a - b);
   const median = offsets[Math.floor(offsets.length / 2)]!;
   const agreeing = best.filter((reply) => Math.abs(reply.offsetMs - median) <= 50);
   return {
     offsetMs: Math.round(median),
-    uncertaintyMs: Math.round(Math.min(...agreeing.map((reply) => reply.delayMs)) / 2),
-    at: Date.now(),
+    // Cover each agreeing server's interval around the rounded estimate. The shortest RTT from
+    // another server alone would understate the uncertainty of the median we actually use.
+    uncertaintyMs: Math.ceil(Math.max(...agreeing.map((reply) =>
+      Math.abs(reply.offsetMs - Math.round(median)) + reply.delayMs / 2))),
+    at,
     servers: agreeing.length,
   };
 }
@@ -77,7 +79,7 @@ export class AtomicClock {
   // Only a recent reading agreed by at least two servers is trusted for the sale start.
   current(now = Date.now()): ClockSync | undefined {
     const sync = this.latest;
-    return sync && now - sync.at <= 10 * 60_000 && sync.servers >= 2 ? sync : undefined;
+    return isFreshClockSync(sync, now) ? sync : undefined;
   }
   // For display: the last reading even if it has become stale.
   last(): ClockSync | undefined { return this.latest; }

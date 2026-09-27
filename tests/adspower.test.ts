@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdsPowerClient, compensateForLatency, responseClockOffset, validateCdpEndpoint } from '../src/browser/adspower';
+import { AdsPowerClient, compensateForLatency, reloadTiming, responseClockOffset, validateCdpEndpoint } from '../src/browser/adspower';
 import { productUrl, taskInputSchema } from '../src/core/model';
 import { task } from './helpers';
 
@@ -194,4 +194,21 @@ it('does not leak raw status errors or connect to external browser endpoints', a
     const error = await failureOf(new AdsPowerClient('http://localhost:50325', '', request).active('abc', new AbortController().signal));
     expect(error.message).not.toContain('private-secret');
   }
+});
+
+describe('reload timing for the journal', () => {
+  const response = (timing: Record<string, number>, date?: string) => ({
+    status: () => 200,
+    headers: () => (date ? { date } : {}) as Record<string, string>,
+    request: () => ({ timing: () => timing }),
+  }) as unknown as Parameters<typeof reloadTiming>[0];
+  it('splits a cold reload into DNS, connection and server time', () => {
+    expect(reloadTiming(response({ startTime: 1, domainLookupStart: 2, domainLookupEnd: 89, connectStart: 89, secureConnectionStart: 101,
+      connectEnd: 118, requestStart: 125, responseStart: 222, responseEnd: 240 }, 'Tue, 29 Sep 2026 07:00:00 GMT')))
+      .toEqual({ httpStatus: 200, dnsMs: 87, connectMs: 29, requestMs: 125, ttfbMs: 97, serverDate: 'Tue, 29 Sep 2026 07:00:00 GMT' });
+  });
+  it('leaves out phases the browser did not report', () => {
+    expect(reloadTiming(response({ startTime: 1, domainLookupStart: -1, domainLookupEnd: -1, connectStart: -1, secureConnectionStart: -1,
+      connectEnd: -1, requestStart: 9, responseStart: 173, responseEnd: -1 }))).toEqual({ httpStatus: 200, requestMs: 9, ttfbMs: 164 });
+  });
 });

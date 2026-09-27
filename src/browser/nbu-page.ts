@@ -112,6 +112,25 @@ async function evaluateInWorld(cdp: CDPSession, expression: string) {
   try { return await run(await (worlds.get(cdp) ?? prepareClickWorld(cdp))); }
   catch { return run(await prepareClickWorld(cdp)); } // The page navigated since the world was made.
 }
+// The shop's own buy handler loads the Turnstile script from here after the click (its
+// cloud_flare_js_url). The page never contacts this host before, so its connection is always cold.
+export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com';
+
+// Connection hints: Chrome resolves DNS and opens TCP/TLS, without any request. A hint starts on
+// insertion, so each element is removed at once. Measured through a profile's proxy after 2.5 min idle:
+// the next reload sent its request after 5 ms instead of 495–731 ms.
+export async function warmConnection(cdp: CDPSession): Promise<void> {
+  await evaluateInWorld(cdp, `(() => {
+    for (const origin of [location.origin, ${JSON.stringify(TURNSTILE_ORIGIN)}]) {
+      const link = document.createElement('link');
+      link.rel = 'preconnect';
+      link.href = origin;
+      (document.head || document.documentElement).appendChild(link);
+      link.remove();
+    }
+  })()`);
+}
+
 // A real mouse click on the buy button: one DevTools round trip to aim, then move, press and release are
 // sent back to back without waiting on each other. Falls back to the DOM click if the mouse missed,
 // so a covered or zoomed button never costs the 11 s click cooldown.

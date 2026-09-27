@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type R
 import { createRoot } from 'react-dom/client';
 import { isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type DesktopApi, type SavedProfile, type Task, type TaskStatus } from '../core/model';
 import { kyivDateTimeInput, nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
+import { isFreshClockSync } from '../core/clock-sync';
 import '@fontsource-variable/inter/index.css';
 import './style.css';
 import { summarizeSales } from '../core/sale-summary';
@@ -515,13 +516,14 @@ function App() {
       `середнє ${s.meanMs} мс · замірів ${s.count} · останній ${when(s.lastAt, now)}${s.anomaly ? ' · АНОМАЛІЯ' : ''}`).join('\n');
   const kyivClock = new Date(now).toLocaleTimeString('uk-UA', { timeZone: SALE_TIME_ZONE });
   const sync = state?.clockSync;
-  const syncFresh = !!sync && now - sync.at <= 10 * 60_000;
+  const syncFresh = isFreshClockSync(sync, now);
   const syncDot = !syncFresh ? 'idle' : Math.abs(sync!.offsetMs) >= 1000 ? 'bad' : Math.abs(sync!.offsetMs) >= 200 ? 'attention' : 'good';
   const syncText = !sync ? '–' : Math.abs(sync.offsetMs) < 1 ? 'точний'
     : `${sync.offsetMs > 0 ? 'відстає' : 'поспішає'} ${Math.abs(sync.offsetMs)} мс`;
   const syncTitle = !sync ? 'Звірка з атомним часом (NTP) ще не вдалася. Перевірте інтернет.'
     : `Годинник комп’ютера ${syncText} від атомного часу (±${sync.uncertaintyMs} мс, серверів: ${sync.servers}, ${when(sync.at, now)}). ` +
-      'Старт продажу рахується за атомним часом, тож похибка годинника комп’ютера на нього не впливає.';
+      (syncFresh ? 'Перед стартом свіжий замір звіряється з часом магазину; його похибка додається до запасу на старті.'
+        : 'Замір застарілий або не підтверджений двома серверами. Для старту використовується обережний розрахунок часу.');
   const preview = (() => {
     try {
       const t = parseKyivDateTime(saleAt);

@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
-import { AtomicClock, parseSntpReply } from '../src/main/ntp';
+import { AtomicClock, parseSntpReply, summarizeClockReplies } from '../src/main/ntp';
+import { CLOCK_SYNC_MAX_AGE_MS } from '../src/core/clock-sync';
 
 const reply = (receiveMs: number, transmitMs: number, stratum = 2) => {
   const buffer = Buffer.alloc(48);
@@ -33,5 +34,22 @@ it('trusts only a recent reading confirmed by two servers', async () => {
   const agreed = new AtomicClock(async () => ({ offsetMs: 42, uncertaintyMs: 5, at: 1000, servers: 3 }));
   agreed.start(); await new Promise((resolve) => setTimeout(resolve, 0)); agreed.stop();
   expect(agreed.current(2000)?.offsetMs).toBe(42);
-  expect(agreed.current(1000 + 11 * 60_000)).toBeUndefined();
+  expect(agreed.current(999)).toBeUndefined();
+  expect(agreed.current(1000 + CLOCK_SYNC_MAX_AGE_MS)?.offsetMs).toBe(42);
+  expect(agreed.current(1001 + CLOCK_SYNC_MAX_AGE_MS)).toBeUndefined();
+});
+
+it('does not assign the fastest server uncertainty to a different median estimate', () => {
+  const sync = summarizeClockReplies([
+    { offsetMs: 100, delayMs: 2 },
+    { offsetMs: 120, delayMs: 80 },
+    { offsetMs: 130, delayMs: 20 },
+    { offsetMs: 900, delayMs: 2 }, // Disagrees, ignored for the uncertainty and server count.
+  ], 1000)!;
+  expect(sync.offsetMs).toBe(130);
+  expect(sync.servers).toBe(3);
+  // The median's range covers 80..160 from the slower agreeing server, not just ±1 ms.
+  expect(sync.uncertaintyMs).toBe(50);
+  expect(sync.offsetMs - sync.uncertaintyMs).toBeLessThanOrEqual(80);
+  expect(summarizeClockReplies([], 1000)).toBeUndefined();
 });

@@ -20,7 +20,8 @@ export interface ShopSession {
   read(): Promise<PageState>;
   recoverRateLimit?(deadline: number): Promise<boolean>;
   waitForActionable(timeoutMs: number): Promise<PageState>;
-  reload(): Promise<void>;
+  // Network timing of the reloaded document, when the browser reports it. For the journal only.
+  reload(): Promise<ReloadTiming | void>;
   serverOffset(): Promise<number>;
   serverOffsetBounds?(): Promise<OffsetBounds | undefined>;
   // Signs in with the account saved for the profile and reloads the tab. False: no usable account.
@@ -32,10 +33,16 @@ export interface ShopSession {
   idle?(ms: number): Promise<void>;
   // Before the sale only: brings the pointer to rest on the buy button within `ms`, scrolling it into view if needed.
   approach?(ms: number): Promise<void>;
+  // Before the sale only: lets the browser open the connection to the shop in advance (DNS, TCP, TLS).
+  // Sends no request; an idle connection would otherwise cost the first sale refresh ~100 ms.
+  warmConnection?(): Promise<void>;
   // 'mouse': a real pointer click; 'dom': the fallback DOM click.
   clickBuy(): Promise<'mouse' | 'dom' | void>;
   disconnect(): Promise<void>;
 }
+
+// Milliseconds from the start of the reload; serverDate is the response's Date header.
+export interface ReloadTiming { dnsMs?: number; connectMs?: number; requestMs?: number; ttfbMs?: number; httpStatus?: number; serverDate?: string }
 
 export interface CaptureRequest { label: string; saleDeltaMs: number; force?: boolean }
 

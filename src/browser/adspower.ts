@@ -3,13 +3,13 @@ import { connectProfile } from './connect';
 import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
 import { intersectBounds, responseOffsetBounds, type OffsetBounds } from '../core/clock-bounds';
-import type { BrowserProvider, PageState, PreparedProfile, PreparationOptions, ShopSession } from '../core/ports';
+import type { BrowserProvider, PageState, PreparedProfile, PreparationOptions, ReloadTiming, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
 import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../core/pointer-motion';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
 import type { NbuLogin } from './nbu-login';
 import type { PageRecorder } from './page-recorder';
-import { assertShopPage, BUY_BUTTON, clickBuyButton, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage } from './nbu-page';
+import { assertShopPage, BUY_BUTTON, clickBuyButton, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage, warmConnection } from './nbu-page';
 
 const startResponse = z.object({
   code: z.literal(0),
@@ -211,6 +211,21 @@ export function compensateForLatency(receivedAt: number, sentAt: number | undefi
   if (sentAt === undefined || !Number.isFinite(sentAt)) return receivedAt;
   const rtt = Math.max(0, receivedAt - sentAt);
   return receivedAt - rtt / 2;
+}
+
+// Where the time of a reload went, from what the browser already recorded. Unknown phases are left out.
+export function reloadTiming(response: Pick<Response, 'status' | 'headers' | 'request'>): ReloadTiming {
+  const timing: ReloadTiming = { httpStatus: response.status() };
+  try {
+    const t = response.request().timing();
+    const span = (from: number, to: number) => from >= 0 && to >= from ? Math.round(to - from) : undefined;
+    const values = { dnsMs: span(t.domainLookupStart, t.domainLookupEnd), connectMs: span(t.connectStart, t.connectEnd),
+      requestMs: t.requestStart >= 0 ? Math.round(t.requestStart) : undefined, ttfbMs: span(t.requestStart, t.responseStart) };
+    for (const [key, value] of Object.entries(values)) if (value !== undefined) timing[key as keyof typeof values] = value;
+  } catch {}
+  const date = response.headers().date;
+  if (date) timing.serverDate = date;
+  return timing;
 }
 
 export class AdsPowerProvider implements BrowserProvider {
@@ -456,6 +471,14 @@ export class AdsPowerProvider implements BrowserProvider {
           };
           // Slow but working answers must still get through: each timeout in a row allows 5 s more.
           let reloadTimeouts = 0;
+          // Chrome drops an unused warmed connection after about 10 s. While reloads wait for a late button,
+          // the hints are renewed so the Turnstile host is still warm when the click finally comes.
+          let warmedAt = 0;
+          const renewWarmth = () => {
+            if (!warmedAt || Date.now() - warmedAt < 5000) return;
+            warmedAt = Date.now();
+            void warmConnection(cdp).catch(() => {});
+          };
           // Handoff reuses the prepared tab: no AdsPower start, new tab or goto.
           return {
             prepared: true,
@@ -480,6 +503,7 @@ export class AdsPowerProvider implements BrowserProvider {
               check(); onTarget();
               if (this.guard.isBlocked()) return; // The buyer will enter the shared recovery loop.
               const timeout = Math.min(25_000, 10_000 + reloadTimeouts * 5000);
+              let timing: ReloadTiming | undefined;
               try {
                 // Chrome's error page cannot be reloaded into the shop: open the coin's address again.
                 navigationSentAt.set(page, Date.now());
@@ -487,13 +511,16 @@ export class AdsPowerProvider implements BrowserProvider {
                   : await page.reload({ waitUntil: 'domcontentloaded', timeout });
                 if (response) { observeResponse(page, response); navigationStatuses.set(page, response.status()); }
                 reloadTimeouts = 0;
+                if (response) timing = reloadTiming(response);
               } catch (error) {
                 if (!transient(error)) throw error;
                 if (error instanceof Error && /Timeout/i.test(error.message)) { reloadTimeouts++; await stopLoading(); }
                 navigationStatuses.delete(page); // Unanswered or dropped: no status to report.
               }
               void prepareClickWorld(cdp).catch(() => {}); // The reload destroyed the previous world.
+              renewWarmth();
               check(); // The buyer reads the fresh page next; a second read here only delays the click.
+              return timing;
             },
             login: async () => {
               check(); assertShopPage(page, target);
@@ -542,6 +569,9 @@ export class AdsPowerProvider implements BrowserProvider {
               }
               const spot = { x: box.rect.left + box.rect.width * (0.3 + Math.random() * 0.4), y: top + box.rect.height * (0.3 + Math.random() * 0.4) };
               await glide(spot, box, until);
+            },
+            warmConnection: async () => {
+              check(); assertShopPage(page, target); warmedAt = Date.now(); await warmConnection(cdp);
             },
             clickBuy: async () => {
               check(); this.guard.check(); assertShopPage(page, target); return clickBuyButton(cdp, page);

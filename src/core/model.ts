@@ -56,6 +56,7 @@ export const taskSchema = taskInputSchema.extend({
   startLoadedMs: z.number().finite().optional(),
   buttonSeenMs: z.number().finite().optional(),
   buttonReloads: z.number().int().nonnegative().optional(),
+  // Browser acknowledgement of the first successful click, not its pre-dispatch intent.
   firstClickMs: z.number().finite().optional(),
   cartMs: z.number().finite().optional(),
   note: z.string(),

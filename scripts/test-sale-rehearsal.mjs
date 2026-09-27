@@ -101,11 +101,12 @@ const recorder = process.env.REHEARSAL_TRACE ? setInterval(() => {
   console.log(`[trace real T${Date.now() - saleAt >= 0 ? '+' : ''}${Date.now() - saleAt}] status=${task.status} last: ${last?.details?.saleDeltaMs} ${last?.message} phase=${last?.details?.phase}`);
 }, 5000) : undefined;
 const ATOMIC = process.argv[4] !== undefined ? Number(process.argv[4]) : undefined;
+const atomicReading = ATOMIC === undefined ? undefined : { offsetMs: ATOMIC, uncertaintyMs: 0, at: Date.now(), servers: 2 };
 if (CRASH) {
   // Through the real scheduler, which owns reconnection.
   const store = new core.Store(join(mkdtempSync(join(tmpdir(), 'rehearsal-store-')), 'tasks.json'));
   await store.load();
-  const scheduler = new core.Scheduler(store, () => realProvider, () => {}, () => {}, (m) => console.log('scheduler error', m), () => ATOMIC);
+  const scheduler = new core.Scheduler(store, () => realProvider, () => {}, () => {}, (m) => console.log('scheduler error', m), () => atomicReading);
   scheduler.start();
   await scheduler.addMany([{ profileId: 'p', url: task.url, saleAt, leadMin: 1, retrySec: 1, windowMin: 2, mode: 'cart' }]);
   setTimeout(async () => {
@@ -117,10 +118,10 @@ if (CRASH) {
   while (Date.now() < until && !['in_cart', 'failed', 'expired', 'interrupted', 'cancelled'].includes(store.tasks()[0]?.status)) await new Promise(r => setTimeout(r, 200));
   Object.assign(task, store.tasks()[0]);
   await scheduler.stop();
-} else await core.runTask(task, provider, core.realClock, AbortSignal.timeout(200_000), async () => {}, () => [], () => ATOMIC);
+} else await core.runTask(task, provider, core.realClock, AbortSignal.timeout(200_000), async () => {}, () => [], () => atomicReading);
 clearInterval(recorder); chrome.kill(); server.close();
 console.log(`\n### ${(process.argv[3] || 'normal').toUpperCase()} server clock skew ${SKEW >= 0 ? '+' : ''}${SKEW} ms → task ${task.status}, bot offset estimate ${task.offsetMs} ms [${task.offsetLowMs}..${task.offsetHighMs}]`);
 for (const e of log) console.log(`  ${e.kind.padEnd(20)} server T${e.atServer >= 0 ? '+' : ''}${e.atServer} ms   (real T${e.atReal >= 0 ? '+' : ''}${e.atReal})`);
-const j = task.events.filter(e => (e.details?.saleDeltaMs ?? -1) >= 0 || !e.details?.saleDeltaMs && e.at >= saleAt - 5000).map(e => `    journal ${String(e.details?.saleDeltaMs ?? '').padStart(6)}  ${e.message}${e.details?.clickMethod ? ' [' + e.details.clickMethod + ']' : ''}`);
+const j = task.events.filter(e => (e.details?.saleDeltaMs ?? -Infinity) >= -5000 || !e.details?.saleDeltaMs && e.at >= saleAt - 5000).map(e => `    journal ${String(e.details?.saleDeltaMs ?? '').padStart(6)}  ${e.message}${e.details?.clickMethod ? ' [' + e.details.clickMethod + ']' : ''}${e.details?.ttfbMs !== undefined ? ` [request ${e.details.requestMs} ms, server ${e.details.ttfbMs} ms, HTTP ${e.details.httpStatus}]` : ''}`);
 console.log(j.join('\n'));
 console.log(`  button seen at T+${task.buttonSeenMs} (bot's server-time estimate), reloads before button: ${task.buttonReloads}, first click T+${task.firstClickMs}, cart T+${task.cartMs}`);

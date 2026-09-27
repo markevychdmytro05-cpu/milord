@@ -1,6 +1,7 @@
 // Adapted from nbu-store-speed-buyer content.js (MIT).
 // Copyright (c) 2026 Mykhailo Toporkov. See third-party/nbu-store-speed-buyer/LICENSE.
 import { intersectBounds, offsetFromBounds, type OffsetBounds } from './clock-bounds';
+import { isFreshClockSync, type ClockSync } from './clock-sync';
 import { isFinal, type Task, type TaskStatus } from './model';
 import { ShopRateLimitError, UserFacingError } from './shop-errors';
 import { describeFailure, describePage, type EventDetails } from './task-journal';
@@ -9,10 +10,8 @@ import type { BrowserProvider, Clock, PageState, ShopSession } from './ports';
 export const CLICK_COOLDOWN_MS = 11_000;
 export const MAX_CLICKS = 5;
 export const WATCH_AFTER_CLICK_MS = 120_000;
-// With the clock verified against atomic time, the sale refresh fires this long after the start.
-// Measured: the shop's clock is within about ±60 ms of UTC and a request needs at least ~27 ms to
-// reach it, so the shop never receives the first refresh before its own start. An early refresh
-// costs far more (a page without the button, then a whole reload interval) than these 40 ms.
+// Base margin after estimated UTC start; add the current NTP uncertainty. This reduces early
+// refreshes but cannot guarantee when the shop's application actually opens the sale.
 export const SALE_START_MARGIN_MS = 40;
 
 type SaveTask = (task: Task) => Promise<void>;
@@ -38,8 +37,8 @@ export async function runTask(
   task: Task, provider: BrowserProvider, clock: Clock, signal: AbortSignal, save: SaveTask,
   // Read at measurement time, so tasks prepared together already see each other's readings.
   priorBounds: () => OffsetBounds[] = () => [],
-  // UTC minus the local clock from SNTP, when a fresh reading exists.
-  atomicOffset: () => number | undefined = () => undefined,
+  // Reads the background sampler's cached result only; no network work in the countdown.
+  atomicSync: () => ClockSync | undefined = () => undefined,
 ): Promise<void> {
   let session: ShopSession | undefined;
   let lastClickAt = 0;
@@ -94,8 +93,8 @@ export async function runTask(
   // Neither a positive estimate nor a fast local clock may advance the sale refresh. Only a clock
   // verified against atomic time, and consistent with the shop's own responses, is used as is.
   let atomicStart = false;
+  let startDeadline = task.saleAt;
   const startNow = () => atomicStart ? serverNow() : Math.min(clock.now(), serverNow());
-  const startAt = () => task.saleAt + (atomicStart ? SALE_START_MARGIN_MS : 0);
   const reloadInterval = () => jitterMs(reloadIntervalMs(startNow() - task.saleAt, task.retrySec));
 
   const update = async (status: TaskStatus, note: string) => {
@@ -220,34 +219,74 @@ export async function runTask(
     if (serverNow() < task.saleAt - 2000) capture('before-sale', true);
     phase = 'визначення серверного часу';
     const bounds = await session.serverOffsetBounds?.();
+    let combined: OffsetBounds | undefined;
     if (bounds) {
       // This session's own range first: an older reading that disagrees with it is dropped.
       const prior = priorBounds();
-      const combined = intersectBounds([bounds, ...prior])!;
-      const atomic = atomicOffset();
-      atomicStart = atomic !== undefined && atomic >= combined.lowMs && atomic <= combined.highMs;
+      combined = intersectBounds([bounds, ...prior])!;
       task.offsetLowMs = bounds.lowMs;
       task.offsetHighMs = bounds.highMs;
-      task.offsetMs = offsetFromBounds(combined, atomic ?? 0);
+      task.offsetMs = offsetFromBounds(combined);
       task.offsetSampledAt = clock.now();
       record('Оцінено різницю часу сервера й комп’ютера.', { offsetLowMs: combined.lowMs, offsetHighMs: combined.highMs,
-        priorSamples: prior.length, ...(atomic !== undefined ? { atomicOffsetMs: atomic, atomicStart } : {}) });
+        priorSamples: prior.length });
     } else {
       task.offsetMs = await session.serverOffset();
       task.offsetSampledAt = clock.now();
       record('Оцінено різницю часу сервера й комп’ютера.');
     }
+    let calibrationKey = '';
+    const refreshStartClock = () => {
+      const now = clock.now();
+      const reading = atomicSync();
+      const sync = isFreshClockSync(reading, now) ? reading : undefined;
+      atomicStart = !!sync && !!combined && sync.offsetMs >= combined.lowMs && sync.offsetMs <= combined.highMs;
+      const margin = atomicStart ? SALE_START_MARGIN_MS + Math.ceil(sync!.uncertaintyMs) : 0;
+      if (atomicStart) {
+        task.offsetMs = sync!.offsetMs;
+        startDeadline = task.saleAt - task.offsetMs + margin;
+      } else {
+        if (combined) task.offsetMs = offsetFromBounds(combined);
+        // Losing a trusted reading must never release an already delayed start early.
+        startDeadline = Math.max(startDeadline, task.saleAt - Math.min(0, task.offsetMs));
+      }
+      const key = JSON.stringify([atomicStart, task.offsetMs, startDeadline, sync?.at, sync?.uncertaintyMs]);
+      if (key !== calibrationKey) {
+        calibrationKey = key;
+        record('Оновлено калібрування старту.', { atomicStart, startDeadline, startMarginMs: margin,
+          ...(sync ? { atomicOffsetMs: sync.offsetMs, atomicUncertaintyMs: sync.uncertaintyMs,
+            atomicSampledAt: sync.at, atomicAgeMs: now - sync.at } : {}) });
+      }
+    };
+    refreshStartClock();
     await persist();
     check();
 
-    let pointerStarted = false, pointerParked = false;
+    let pointerStarted = false, pointerParked = false, connectionWarmed = false;
     let brokenReloadAt = -Infinity;
     // Pointer activity is cosmetic: it must never fail or delay the purchase.
     const quietly = async (action: () => Promise<void>) => {
       try { await action(); } catch (error) { if (signal.aborted) throw error; }
     };
-    while (startNow() < startAt()) {
-      const remaining = startAt() - startNow();
+    for (;;) {
+      refreshStartClock();
+      const remaining = startDeadline - clock.now();
+      if (remaining <= 0) {
+        // Recheck verification/login at the deadline, then re-read the cached clock in case
+        // waiting for the user or a queue took long enough for a newer sample to arrive.
+        if (!await waitUntilReady()) return;
+        refreshStartClock();
+        if (clock.now() < startDeadline) continue;
+        break;
+      }
+      // The tab has been idle for minutes, so the browser has dropped its connection to the shop. Opening it
+      // again now (no request) spares the sale refresh the DNS and TLS round trips.
+      if (remaining <= 3500 && remaining > 1000 && !connectionWarmed && session.warmConnection) {
+        connectionWarmed = true;
+        await quietly(() => session!.warmConnection!());
+        record('Підготовлено з’єднання з магазином перед стартом.');
+        continue;
+      }
       // Park on the button a few seconds early, so the click itself is a short, still press.
       if (remaining <= 3500 && remaining > 2000 && !pointerParked && session.approach) {
         pointerParked = true;
@@ -282,8 +321,8 @@ export async function runTask(
       } else {
         await update('waiting', 'Профіль готовий. Очікуємо початок продажу.');
       }
-      const pause = Math.min(1000, Math.max(1, startAt() - startNow() - 1000));
-      if (session.idle && !pointerParked && startAt() - startNow() > 4000) {
+      const pause = Math.min(1000, Math.max(1, startDeadline - clock.now() - 1000));
+      if (session.idle && !pointerParked && startDeadline - clock.now() > 4000) {
         if (!pointerStarted) { pointerStarted = true; record('Легкий рух миші під час очікування, без кліків і переходів.'); }
         const started = clock.now();
         await quietly(() => session!.idle!(pause));
@@ -292,9 +331,6 @@ export async function runTask(
       } else await wait(pause);
     }
     check();
-    // A challenge may have appeared during the final countdown. Recheck once at the
-    // deadline rather than destroying an in-progress verification with the sale refresh.
-    if (!await waitUntilReady()) return;
     if (serverNow() >= saleDeadline()) {
       await update('expired', 'Вікно продажу завершилося під час очікування.');
       return;
@@ -305,9 +341,9 @@ export async function runTask(
       check();
       phase = 'стартове оновлення сторінки';
       record(readyToBuy ? 'Оновлення: вкладка не була підготовлена.' : 'Оновлення: на старті кнопка недоступна.');
-      await session.reload();
+      const timing = await session.reload();
       task.startLoadedMs ??= serverNow() - task.saleAt;
-      record('Стартове оновлення завершено.');
+      record('Стартове оновлення завершено.', timing ? { ...timing } : {});
     } else record('Підготовлена кнопка доступна; стартове оновлення пропущено.');
     nextReloadAt = clock.now() + reloadInterval();
     let detectImmediately = true;
@@ -386,13 +422,16 @@ export async function runTask(
           phase = 'натискання кнопки покупки';
           lastDecision = '';
           task.clicks++;
-          task.firstClickMs ??= serverNow() - task.saleAt;
           lastClickAt = clock.now();
           watchUntil ||= lastClickAt + WATCH_AFTER_CLICK_MS;
           await update('firing', `Спроба додати в кошик: ${task.clicks}/${MAX_CLICKS}.`);
           check();
           try {
             const method = await session.clickBuy();
+            // Browser acknowledgement, not intent: includes disk persistence and dispatch.
+            // It is an upper bound on the click-event time; a failed/unknown click has no metric.
+            task.firstClickMs ??= serverNow() - task.saleAt;
+            lastClickAt = clock.now();
             record('Натискання виконано. Це ще не підтвердження кошика.', { watchUntil, ...(method ? { clickMethod: method } : {}) });
             capture(`click-${task.clicks}`, true);
           }
@@ -409,8 +448,8 @@ export async function runTask(
         check();
         phase = 'повторне оновлення сторінки';
         record('Повторне оновлення: кнопка недоступна, інтервал очікування минув.');
-        await session.reload();
-        record('Повторне оновлення завершено.');
+        const timing = await session.reload();
+        record('Повторне оновлення завершено.', timing ? { ...timing } : {});
         nextReloadAt = clock.now() + reloadInterval();
         detectImmediately = true;
       } else if (!task.clicks) {

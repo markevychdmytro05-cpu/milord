@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { runTask } from '../core/buyer';
 import { priorOffsetBounds } from '../core/clock-bounds';
+import type { ClockSync } from '../core/clock-sync';
 import { isFinal, productUrl, taskInputSchema, type Task, type TaskInput } from '../core/model';
 import { realClock, type BrowserProvider, type PreparedProfile } from '../core/ports';
 import { UserFacingError } from '../core/shop-errors';
@@ -35,8 +36,8 @@ export class Scheduler {
     private readonly onTask: (task: Task) => void,
     private readonly onBusy: (busy: boolean) => void,
     private readonly onError: (message: string) => void,
-    // UTC minus the local clock from SNTP, when a fresh reading exists.
-    private readonly atomicOffset: () => number | undefined = () => undefined,
+    // Latest SNTP reading, including its age and uncertainty.
+    private readonly atomicSync: () => ClockSync | undefined = () => undefined,
   ) {}
 
   start(): void {
@@ -270,7 +271,7 @@ export class Scheduler {
             throw error;
           }
           this.onTask(next);
-        }, () => priorOffsetBounds(this.store.tasks(), task.profileId, Date.now(), task.id), this.atomicOffset);
+        }, () => priorOffsetBounds(this.store.tasks(), task.profileId, Date.now(), task.id), this.atomicSync);
         await this.reconnectIfLost(task.id, startedAt);
       }).catch(async () => {
         if (!diskFailed && await this.finishUnexpected(task.id)) return;

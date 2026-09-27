@@ -97,7 +97,7 @@ async function boot(): Promise<void> {
     () => new AdsPowerProvider(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, recorder),
     notify, busy,
     (message) => dialog.showErrorBox('Планувальник зупинено', message),
-    () => atomicClock.current()?.offsetMs,
+    () => atomicClock.current(),
   );
 
   function handle(channel: string, handler: (input: unknown) => unknown) {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runTask, reloadIntervalMs, jitterMs, CLICK_COOLDOWN_MS, MAX_CLICKS, SALE_START_MARGIN_MS } from '../src/core/buyer';
+import { CLOCK_SYNC_MAX_AGE_MS, type ClockSync } from '../src/core/clock-sync';
 import { fakeBrowser, FakeClock, ready, task } from './helpers';
 
 describe('purchase workflow', () => {
@@ -383,6 +384,7 @@ it('recovers when another tab reports 429 between persisted intent and the actua
   const input = task();
   await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
   expect(input.status).toBe('in_cart'); expect(input.clicks).toBe(1); expect(browser.clicks).toHaveLength(1);
+  expect(input.firstClickMs).toBe(30_000); // The refused attempt must not become the first-click time.
 });
 
 describe('reload interval', () => {
@@ -438,13 +440,56 @@ describe('pointer before the sale', () => {
   });
 });
 
+describe('connection before the sale', () => {
+  it('opens the connection once, 1–3.5 s before the start and before the pointer parks', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, inCart: browser.clicks.length > 0 }));
+    const warms: number[] = [];
+    const approaches: number[] = [];
+    browser.session.warmConnection = async () => { warms.push(clock.now()); };
+    browser.session.approach = async (ms) => { approaches.push(clock.now()); clock.time += ms; };
+    const input = task({ saleAt: clock.time + 20_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(warms).toHaveLength(1);
+    expect(warms[0]!).toBeGreaterThanOrEqual(input.saleAt - 3500);
+    expect(warms[0]!).toBeLessThan(input.saleAt - 1000);
+    expect(warms[0]!).toBeLessThanOrEqual(approaches[0]!);
+    expect(input.events.some((event) => event.message.startsWith('Підготовлено з’єднання'))).toBe(true);
+  });
+
+  it('keeps buying when the connection cannot be prepared', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, inCart: browser.clicks.length > 0 }));
+    browser.session.warmConnection = async () => { throw new Error('page closed'); };
+    const input = task({ saleAt: clock.time + 10_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toHaveLength(1);
+  });
+
+  it('journals where the time of each reload went', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: browser.reloads.length > 1, inCart: browser.clicks.length > 0 }));
+    const reload = browser.session.reload;
+    browser.session.reload = async () => { await reload(); return { dnsMs: 0, connectMs: 0, requestMs: 12, ttfbMs: 160, httpStatus: 200, serverDate: 'Tue, 29 Sep 2026 07:00:00 GMT' }; };
+    const input = task({ saleAt: clock.time + 10_000 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    const start = input.events.find((event) => event.message === 'Стартове оновлення завершено.');
+    const again = input.events.find((event) => event.message === 'Повторне оновлення завершено.');
+    expect(start?.details).toMatchObject({ requestMs: 12, ttfbMs: 160, httpStatus: 200, serverDate: 'Tue, 29 Sep 2026 07:00:00 GMT' });
+    expect(again?.details).toMatchObject({ ttfbMs: 160 });
+  });
+});
+
 describe('sale start by atomic time', () => {
   const run = async (atomic: number | undefined, bounds = { lowMs: -500, highMs: 500 }) => {
     const clock = new FakeClock();
     const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: browser.reloads.length > 0, inCart: browser.clicks.length > 0 }));
     browser.session.serverOffsetBounds = async () => bounds;
     const input = task({ saleAt: clock.time + 30_000 });
-    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {}, () => [], () => atomic);
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {}, () => [],
+      () => atomic === undefined ? undefined : { offsetMs: atomic, uncertaintyMs: 0, at: 1_000_000, servers: 2 });
     return { input, firstReload: browser.reloads[0]! };
   };
   it('fires the first refresh 40 ms after the start by atomic time when the local clock is fast', async () => {
@@ -466,5 +511,57 @@ describe('sale start by atomic time', () => {
     const contradicted = await run(0, { lowMs: 200, highMs: 900 });
     expect(contradicted.input.offsetMs).toBe(200);
     expect(contradicted.firstReload).toBeGreaterThanOrEqual(contradicted.input.saleAt);
+  });
+
+  const countdown = async (reading: (clock: FakeClock) => ClockSync | undefined, leadMs = 30_000) => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready, buyAvailable: browser.reloads.length > 0 }));
+    browser.session.serverOffsetBounds = async () => ({ lowMs: -1000, highMs: 1000 });
+    const input = task({ saleAt: clock.time + leadMs, mode: 'observe' });
+    const saves: number[] = [];
+    await runTask(input, browser.provider, clock, new AbortController().signal,
+      async () => { saves.push(clock.now()); }, () => [], () => reading(clock));
+    return { input, firstReload: browser.reloads[0]!, saves };
+  };
+
+  it('uses a newer cached reading arriving in the final second, including its uncertainty', async () => {
+    const { input, firstReload, saves } = await countdown(clock => clock.now() < 1_029_500
+      ? { offsetMs: 100, uncertaintyMs: 5, at: 1_000_000, servers: 3 }
+      : { offsetMs: -300, uncertaintyMs: 35, at: 1_029_500, servers: 3 });
+    expect(firstReload).toBe(input.saleAt + 300 + SALE_START_MARGIN_MS + 35);
+    expect(input.offsetMs).toBe(-300);
+    expect(saves.filter(at => at >= 1_029_500 && at < firstReload)).toEqual([]);
+    expect(input.events.filter(event => event.message === 'Оновлено калібрування старту.').at(-1)?.details)
+      .toMatchObject({ atomicUncertaintyMs: 35, startMarginMs: 75, atomicSampledAt: 1_029_500 });
+  });
+
+  it('adds uncertainty so the earliest UTC allowed by the reading is already past the margin', async () => {
+    const { input, firstReload } = await countdown(() =>
+      ({ offsetMs: 300, uncertaintyMs: 180, at: 1_000_000, servers: 2 }));
+    expect(firstReload + 300 - 180).toBe(input.saleAt + SALE_START_MARGIN_MS);
+  });
+
+  it.each([
+    { offsetMs: 300, uncertaintyMs: 5, at: 1_000_000 - CLOCK_SYNC_MAX_AGE_MS - 1, servers: 3 },
+    { offsetMs: 300, uncertaintyMs: 5, at: 2_000_000, servers: 3 },
+    { offsetMs: 300, uncertaintyMs: 5, at: 1_000_000, servers: 1 },
+    { offsetMs: 300, uncertaintyMs: NaN, at: 1_000_000, servers: 3 },
+  ])('does not advance the sale from an untrusted reading: %j', async reading => {
+    const { input, firstReload } = await countdown(() => reading);
+    expect(firstReload).toBe(input.saleAt);
+    expect(input.offsetMs).toBe(0);
+  });
+
+  it('does not move the start earlier when a negative correction expires while waiting', async () => {
+    const { input, firstReload } = await countdown(() =>
+      ({ offsetMs: -300, uncertaintyMs: 20, at: 1_000_000, servers: 2 }), CLOCK_SYNC_MAX_AGE_MS + 5000);
+    expect(firstReload).toBe(input.saleAt + 300 + SALE_START_MARGIN_MS + 20);
+    expect(input.events.filter(event => event.message === 'Оновлено калібрування старту.').at(-1)?.details?.atomicStart).toBe(false);
+  });
+
+  it('picks up the first valid reading after preparation had no NTP result', async () => {
+    const { input, firstReload } = await countdown(clock => clock.now() < 1_029_500 ? undefined
+      : { offsetMs: -200, uncertaintyMs: 10, at: 1_029_500, servers: 2 });
+    expect(firstReload).toBe(input.saleAt + 200 + SALE_START_MARGIN_MS + 10);
   });
 });

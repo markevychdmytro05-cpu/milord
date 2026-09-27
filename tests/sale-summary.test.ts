@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runTask } from '../src/core/buyer';
+import { ShopRateLimitError } from '../src/core/shop-errors';
 import { summarizeSales } from '../src/core/sale-summary';
 import { HISTORY_MAX_AGE_MS, HISTORY_MAX_FINISHED, pruneHistory, Store } from '../src/main/store';
 import { fakeBrowser, FakeClock, ready, task } from './helpers';
@@ -35,6 +36,52 @@ describe('sale timings', () => {
     const input = task();
     await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
     expect(input.cartMs).toBeUndefined();
+  });
+
+  it('measures the acknowledged click after the durable intent and browser dispatch', async () => {
+    const clock = new FakeClock();
+    const input = task();
+    let intentSaved = false;
+    const browser = fakeBrowser(clock, () => ({ ...ready, inCart: browser.clicks.length > 0 }));
+    const click = browser.session.clickBuy;
+    browser.session.clickBuy = async () => {
+      expect(intentSaved).toBe(true);
+      expect(input.firstClickMs).toBeUndefined();
+      clock.time += 30;
+      await click();
+      clock.time += 5; // Browser acknowledgement arrives after the actual event.
+    };
+    await runTask(input, browser.provider, clock, new AbortController().signal, async saved => {
+      if (saved.clicks === 1 && !intentSaved) {
+        expect(saved.firstClickMs).toBeUndefined();
+        clock.time += 120; // Slow disk must be included in the reported latency.
+        intentSaved = true;
+      }
+    });
+    expect(input.firstClickMs).toBe(155);
+    expect(input.firstClickMs! - input.buttonSeenMs!).toBe(155);
+    expect(browser.clicks[0]! - input.saleAt).toBe(150);
+    expect(input.status).toBe('in_cart');
+  });
+
+  it.each(['cancel', 'disk', 'browser', 'rate-limit'])('does not report an unsent or unconfirmed click after %s', async failure => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock);
+    const input = task();
+    const controller = new AbortController();
+    let rejectedSave = false;
+    if (failure === 'browser') browser.session.clickBuy = async () => { throw new Error('Disconnected'); };
+    if (failure === 'rate-limit') browser.session.clickBuy = async () => {
+      controller.abort(); // Stop after the provider refuses dispatch; no second attempt.
+      throw new ShopRateLimitError();
+    };
+    await runTask(input, browser.provider, clock, controller.signal, async saved => {
+      if (!saved.clicks) return;
+      if (failure === 'cancel') controller.abort();
+      if (failure === 'disk' && !rejectedSave) { rejectedSave = true; throw new Error('Disk full'); }
+    });
+    expect(input.firstClickMs).toBeUndefined();
+    expect(browser.clicks).toHaveLength(0);
   });
 });
 
