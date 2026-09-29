@@ -15,7 +15,7 @@ const errorText = (error: unknown) => error instanceof Error
 const time = (at: number) => new Date(at).toLocaleString('uk-UA', { timeZone: SALE_TIME_ZONE });
 const orderKey = (profileId: string, id: string) => `${profileId}:${id}`;
 
-export function Cabinet({ profiles, now, active, connection }: { profiles: SavedProfile[]; now: number; active: boolean; connection: string }) {
+export function Cabinet({ profiles, now, active, connection, enabled = true }: { profiles: SavedProfile[]; now: number; active: boolean; connection: string; enabled?: boolean }) {
   const [restored] = useState(emptyCabinetState);
   const [cacheReady, setCacheReady] = useState(false);
   const [restoreError, setRestoreError] = useState('');
@@ -24,7 +24,7 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
   const [autoRefresh, setAutoRefresh] = useState(() => localStorage.getItem('cabinet-auto-refresh') !== 'off');
   const autoSchedule = useRef(new CabinetRefreshSchedule(restored.schedule));
   const autoAllowed = useRef(false);
-  autoAllowed.current = active && autoRefresh;
+  autoAllowed.current = enabled && active && autoRefresh;
   const refreshCurrent = useRef<(automatic: boolean) => Promise<void>>(async () => {});
   const [section, setSection] = useState<CabinetSection>('orders');
   const [profile, setProfile] = useState('');
@@ -76,7 +76,7 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
     const targets = automatic
       ? autoRefreshTargets(dueEligible, id => !!snapshots[id]).map(id => eligible.find(p => p.id === id)!)
       : eligible;
-    if (!cacheReady || busy.current || !targets.length) return;
+    if (!enabled || !cacheReady || busy.current || !targets.length) return;
     busy.current = true;
     if (!automatic) setSelectedId(undefined);
     try {
@@ -126,14 +126,14 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
   }, [cacheReady, connection, profileIds, snapshots, errors, attemptedAt, details, section, profile, query, pageNumber, loading]);
   useEffect(() => { localStorage.setItem('cabinet-auto-refresh', autoRefresh ? 'on' : 'off'); }, [autoRefresh]);
   useEffect(() => {
-    if (cacheReady && active && autoRefresh && document.visibilityState === 'visible') void refreshCurrent.current(true);
-  }, [cacheReady, active, autoRefresh, now]);
+    if (enabled && cacheReady && active && autoRefresh && document.visibilityState === 'visible') void refreshCurrent.current(true);
+  }, [enabled, cacheReady, active, autoRefresh, now]);
   async function showOrder(order: CabinetOrder & { profileId: string }, button: HTMLButtonElement) {
     if (order.mergedInto) return;
     const key = orderKey(order.profileId, order.id);
     lastDetailButton.current = button; setSelectedId(key);
     requestAnimationFrame(() => closeButton.current?.focus());
-    if (details[key] || busy.current) return;
+    if (!enabled || details[key] || busy.current) return;
     busy.current = true; setLoading(`Деталі замовлення ${order.id}…`);
     setDetailErrors(current => ({ ...current, [key]: '' }));
     try {
@@ -143,7 +143,7 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
     finally { busy.current = false; setLoading(''); }
   }
   async function loadMore(profileId: string, page: number) {
-    if (busy.current) return;
+    if (!enabled || busy.current) return;
     busy.current = true; setLoading(`Ще замовлення: ${profileName(profileId)}…`);
     try {
       const result = await window.desktop.loadCabinetOrders({ profileId, page });
@@ -176,12 +176,12 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
           {profiles.map(item => <option key={item.id} value={item.id}>{item.name || item.id}</option>)}
         </select>
       </label>
-      <button type="button" className="ghost" disabled={!cacheReady || !!loading || !scope.length || coolingDown} onClick={() => void refresh()}>
+      <button type="button" className="ghost" disabled={!enabled || !cacheReady || !!loading || !scope.length || coolingDown} onClick={() => void refresh()}>
         {loading ? 'Завантаження…' : coolingDown ? `Оновити через ${waitSeconds} с` : 'Оновити кабінет'}
       </button>
     </div>
     <div className="cabinet-meta">
-      <label className="cabinet-auto" title="Автоматично оновлює лише кошик, поки відкритий кабінет"><input type="checkbox" checked={autoRefresh} onChange={event => setAutoRefresh(event.target.checked)} />
+      <label className="cabinet-auto" title="Автоматично оновлює лише кошик, поки відкритий кабінет"><input type="checkbox" checked={autoRefresh} disabled={!enabled} onChange={event => setAutoRefresh(event.target.checked)} />
         Автооновлення кошика · 15 хв
       </label>
       <details className="cabinet-sync-details">
@@ -231,12 +231,12 @@ export function Cabinet({ profiles, now, active, connection }: { profiles: Saved
               <div><dt>Шт.</dt><dd>{order.quantity ?? '–'}</dd></div>
               <div className="order-tracking"><dt>ТТН</dt><dd>{order.tracking || '–'}</dd></div>
             </dl>
-            {order.mergedInto ? <p className="hint">Деталі – у замовленні №{order.mergedInto}</p> : <button type="button" className="ghost order-view" disabled={!!loading} aria-label={`Дивитись замовлення ${order.id} · ${profileName(order.profileId)}`}
+            {order.mergedInto ? <p className="hint">Деталі – у замовленні №{order.mergedInto}</p> : <button type="button" className="ghost order-view" disabled={!!loading || (!enabled && !details[orderKey(order.profileId, order.id)])} aria-label={`Дивитись замовлення ${order.id} · ${profileName(order.profileId)}`}
               aria-expanded={selectedId === orderKey(order.profileId, order.id)} aria-controls="order-details"
               onClick={event => void showOrder(order, event.currentTarget)}>Дивитись</button>}
           </article>)}
           {currentPage(name) === pageCount(name) && visible.filter(snapshot => snapshot.nextOrdersPage).map(snapshot => <button key={snapshot.profileId} type="button" className="ghost cabinet-more"
-            disabled={!!loading} onClick={() => void loadMore(snapshot.profileId, snapshot.nextOrdersPage!)}>Ще замовлення · {profileName(snapshot.profileId)}</button>)}
+            disabled={!enabled || !!loading} onClick={() => void loadMore(snapshot.profileId, snapshot.nextOrdersPage!)}>Ще замовлення · {profileName(snapshot.profileId)}</button>)}
           {!shownOrders.length && <CabinetEmpty title={loaded('orders') ? (query ? 'Замовлень не знайдено' : 'Замовлень немає') : 'Замовлення ще не завантажені'}
             text={loaded('orders') ? (query ? 'Змініть пошуковий запит.' : 'У вибраних профілів немає замовлень.') : 'Натисніть «Оновити кабінет», щоб прочитати дані з профілів AdsPower.'} />}
         </div>

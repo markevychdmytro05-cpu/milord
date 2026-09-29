@@ -8,7 +8,7 @@ import { Store } from '../src/main/store';
 import { task } from './helpers';
 import type { PreparationOptions } from '../src/core/ports';
 
-async function setup() {
+async function setup(canStart: () => boolean = () => true) {
   const path = join(await mkdtemp(join(tmpdir(), 'nbu-scheduler-')), 'tasks.json');
   const store = new Store(path);
   const signals = new Map<string, AbortSignal>();
@@ -19,9 +19,24 @@ async function setup() {
       signal.addEventListener('abort', () => reject(Error('cancelled')), { once: true });
     });
   }) };
-  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {});
+  const scheduler = new Scheduler(store, () => provider, () => {}, () => {}, () => {}, undefined, canStart);
   return { path, store, scheduler, provider, signals };
 }
+it('keeps persisted scheduled tasks idle without license access and starts them after activation', async () => {
+  let allowed = false;
+  const { store, scheduler, provider } = await setup(() => allowed);
+  try {
+    await scheduler.add(task({ saleAt: Date.now() + 60_000 }));
+    expect(store.tasks()[0]?.status).toBe('scheduled');
+    expect(provider.connect).not.toHaveBeenCalled();
+    allowed = true; scheduler.start();
+    await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledTimes(1));
+    allowed = false;
+    expect(provider.connect).toHaveBeenCalledTimes(1);
+    await scheduler.cancel(store.tasks()[0]!.id);
+    expect(store.tasks()[0]?.status).toBe('cancelled');
+  } finally { await scheduler.stop(); }
+});
 it('starts distinct profiles concurrently and cancels one independently', async () => {
   const { store, scheduler, provider, signals } = await setup();
   try {
@@ -32,6 +47,34 @@ it('starts distinct profiles concurrently and cancels one independently', async 
     expect(signals.get('profile_a')!.aborted).toBe(true);
     expect(signals.get('profile_b')!.aborted).toBe(false);
     expect(store.tasks().find((task) => task.profileId === 'profile_a')!.status).toBe('cancelled');
+  } finally { await scheduler.stop(); }
+});
+it('cancels active and future work on license removal and never resumes it after reactivation', async () => {
+  const { store, scheduler, provider, signals } = await setup();
+  try {
+    await scheduler.addMany([
+      task({ profileId: 'running', saleAt: Date.now() + 60_000 }),
+      task({ profileId: 'future', saleAt: Date.now() + 86_400_000 }),
+    ]);
+    await vi.waitFor(() => expect(provider.connect).toHaveBeenCalledTimes(1));
+    await scheduler.cancelAll('Ліцензію видалено.');
+    expect(signals.get('running')?.aborted).toBe(true);
+    expect(store.tasks().every(task => task.status === 'cancelled')).toBe(true);
+    expect(store.tasks().every(task => task.note === 'Ліцензію видалено.')).toBe(true);
+    scheduler.start();
+    expect(provider.connect).toHaveBeenCalledTimes(1);
+    expect(store.tasks().every(task => task.status === 'cancelled')).toBe(true);
+  } finally { await scheduler.stop(); }
+});
+it('includes a task mutation already queued at the time license access was removed', async () => {
+  const { store, scheduler, provider } = await setup();
+  try {
+    const creating = scheduler.add(task({ saleAt: Date.now() + 86_400_000 }));
+    const cancelling = scheduler.cancelAll('Ліцензію видалено.');
+    await Promise.all([creating, cancelling]);
+    expect(store.tasks()).toHaveLength(1);
+    expect(store.tasks()[0]?.status).toBe('cancelled');
+    scheduler.start(); expect(provider.connect).not.toHaveBeenCalled();
   } finally { await scheduler.stop(); }
 });
 it('rejects the whole batch on a conflict or duplicate profile and persists valid batches', async () => {

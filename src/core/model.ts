@@ -3,6 +3,7 @@ import type { CabinetSavedState } from './cabinet-state';
 import { z } from 'zod';
 import type { CabinetSection, CabinetSnapshot, CabinetOrderDetails, CabinetOrdersPage } from './cabinet';
 import type { OffsetHistorySummary } from './offset-history';
+import type { LicenseState } from './license';
 
 export function productUrl(value: string): string {
   const url = new URL(value);
@@ -97,6 +98,7 @@ export type Settings = z.infer<typeof settingsSchema>;
 export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({ apiUrl: 'http://127.0.0.1:50325' });
 
 export interface AppState {
+  license: LicenseState;
   tasks: Task[];
   settings: Settings;
   hasApiKey: boolean;
@@ -114,6 +116,9 @@ export interface AppState {
 export interface AdsProfile { id: string; name: string; number: string; }
 
 export interface DesktopApi {
+  activateLicense(key: string): Promise<void>;
+  checkLicense(): Promise<void>;
+  clearLicense(): Promise<void>;
   testBehavior(input: { profileId: string; navigate: boolean; showCursor: boolean; minutes: number }): Promise<BehaviorTestResult>;
   stopBehaviorTest(profileId: string): Promise<void>;
   restoreCabinet(input: { connection: string; legacy?: string }): Promise<CabinetSavedState>;

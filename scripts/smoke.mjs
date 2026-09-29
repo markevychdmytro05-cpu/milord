@@ -27,6 +27,7 @@ const launch = async () => {
   application = await electron.launch({ args: ['.'],
     env: { ...process.env, TZ: 'America/Los_Angeles', NBU_DESKTOP_TEST_DATA: dataDirectory, ADSPOWER_API_KEY: '' }, timeout: 30_000 });
   const page = await application.firstWindow();
+  await page.evaluate(() => window.desktop.activateLicense('NBU2-TEST-FRND-2626'), undefined, undefined, false);
   await page.route('https://cdn-nbu.solomono.net/bank/images/ui-test-*.svg', route => route.request().url().includes('missing') ? route.abort()
     : route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><circle cx="40" cy="40" r="34" fill="#ddd6bc" stroke="#9e9577" stroke-width="3"/><text x="40" y="50" text-anchor="middle" font-size="28" fill="#605638">N</text></svg>' }));
   await page.getByRole('heading', { name: 'Нове завдання' }).waitFor();

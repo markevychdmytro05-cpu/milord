@@ -3,7 +3,7 @@ import type { SavedProfile } from '../core/model';
 
 const loginLabels = { 'logged-in': 'так', 'logged-out': 'ні', unknown: '?' } as const;
 
-export function BehaviorTest({ profiles, now }: { profiles: SavedProfile[]; now: number }) {
+export function BehaviorTest({ profiles, now, enabled = true }: { profiles: SavedProfile[]; now: number; enabled?: boolean }) {
   const [selectedIds, setSelectedIds] = useState<string[] | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -57,7 +57,7 @@ export function BehaviorTest({ profiles, now }: { profiles: SavedProfile[]; now:
       <h2 id="behavior-test-title"><button type="button" className="behavior-expand" aria-expanded={expanded} aria-controls="behavior-test-body"
         onClick={() => setExpanded(value => !value)}>Прогрів профілів <span aria-hidden="true">{expanded ? '⌃' : '⌄'}</span></button></h2>
       {running ? <button type="button" className="ghost" disabled={stopping} onClick={() => void stop()}>{stopping ? 'Зупиняємо…' : 'Зупинити прогрів'}</button>
-        : <button type="button" className="ghost" disabled={!chosen.length || !validDuration} onClick={() => void run()}>Прогріти</button>}
+        : <button type="button" className="ghost" disabled={!enabled || !chosen.length || !validDuration} onClick={() => void run()}>Прогріти</button>}
     </div>
     <p className="hint behavior-status" role="status">{running ? (stopping ? 'Зупинка…' : `Активних профілів: ${activeCount} · ${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`)
       : hasWarning ? 'Перевірте журнал прогріву' : events.length ? 'Прогрів завершено' : `${selectionLabel} · ${minutes} хв`}</p>

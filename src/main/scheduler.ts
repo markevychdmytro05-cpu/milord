@@ -38,9 +38,12 @@ export class Scheduler {
     private readonly onError: (message: string) => void,
     // Latest SNTP reading, including its age and uncertainty.
     private readonly atomicSync: () => ClockSync | undefined = () => undefined,
+    // A cached local decision; license HTTP requests never enter the purchase countdown.
+    private readonly canStart: () => boolean = () => true,
   ) {}
 
   start(): void {
+    clearInterval(this.timer);
     this.stopped = false;
     this.timer = setInterval(() => this.tick(), 500);
     this.tick();
@@ -148,6 +151,24 @@ export class Scheduler {
     });
   }
 
+  cancelAll(reason: string): Promise<void> {
+    const pending = new Set(this.store.tasks().filter(task => !isFinal(task.status)).map(task => task.id));
+    const stopped = this.stop();
+    return this.serialize(async () => {
+      await stopped;
+      // Include tasks from IPC mutations that were already queued when access was removed.
+      for (const task of this.store.tasks()) if (!isFinal(task.status)) pending.add(task.id);
+      for (const id of pending) {
+        const task = this.store.tasks().find(item => item.id === id);
+        if (!task || (isFinal(task.status) && task.status !== 'cancelled')) continue;
+        task.status = 'cancelled'; task.note = reason; task.updatedAt = Date.now();
+        task.events = [...task.events, { at: task.updatedAt, message: reason }].slice(-200);
+        await this.store.saveTask(task); this.onTask(task);
+      }
+      this.onBusy(false);
+    });
+  }
+
   // Bounded like readProfile: a hung AdsPower start or a long 429 wait must not hold the profile
   // (and block new tasks for it) indefinitely, and quitting the app aborts it.
   inspect(profileId: string, url: string, timeoutMs = INSPECT_TIMEOUT_MS): Promise<string> {
@@ -217,7 +238,7 @@ export class Scheduler {
   }
 
   private tick(): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.canStart()) return;
     for (const task of this.store.tasks()) {
       if (task.status === 'scheduled' && task.saleAt - task.leadMin * 60_000 <= Date.now()) {
         this.profileReads.get(task.profileId)?.controller.abort();

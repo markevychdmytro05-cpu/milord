@@ -15,6 +15,8 @@ body { margin: 0; background: var(--paper); }
 h1, h2, h3, p { margin: 0; }
 p { line-height: 1.55; }
 code, .mono { font-family: var(--mono); font-size: 12px; }
+.advanced code { overflow-wrap: anywhere; word-break: break-all; }
+.advanced .hint { overflow-wrap: anywhere; }
 .muted, .hint, time { color: var(--muted); }
 .hint { font-size: 13px; }
 .hint.warn { color: var(--warn); }

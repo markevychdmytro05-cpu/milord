@@ -21,6 +21,13 @@ import { NbuLogin } from '../browser/nbu-login';
 import { PageRecorder } from '../browser/page-recorder';
 import { launchAdsPower } from './adspower-launcher';
 import { AtomicClock } from './ntp';
+import { hostname } from 'node:os';
+import { deviceId } from './device-id';
+import { LicenseClient } from './license-client';
+
+declare const __LICENSE_SERVER_URL__: string;
+declare const __LICENSE_PUBLIC_KEY__: string;
+declare const __ALLOW_TEST_LICENSE__: boolean;
 
 app.setName('NBU Desktop');
 // UI smoke tests use an isolated temporary directory, never the user's task history.
@@ -53,6 +60,26 @@ async function boot(): Promise<void> {
   let secretError = restoredKey.error;
   let blocker: number | undefined;
   let scheduler: Scheduler;
+  let licenseSuspended = false;
+  let licenseGeneration = 0;
+  const accountsUsed = (extra: string[] = []) => new Set([
+    ...store.settings().savedProfiles.map(profile => profile.id),
+    ...store.tasks().filter(task => !isFinal(task.status)).map(task => task.profileId), ...extra,
+  ]).size;
+  const license = new LicenseClient({
+    serverUrl: app.isPackaged ? __LICENSE_SERVER_URL__ : process.env.NBU_LICENSE_SERVER_URL || __LICENSE_SERVER_URL__,
+    publicKey: app.isPackaged ? __LICENSE_PUBLIC_KEY__ : process.env.NBU_LICENSE_PUBLIC_KEY || __LICENSE_PUBLIC_KEY__,
+    deviceId: await deviceId(join(app.getPath('userData'), 'license-device-id')),
+    deviceName: hostname(), appVersion: app.getVersion(), allowTestKey: __ALLOW_TEST_LICENSE__,
+  }, new KeyStore(join(app.getPath('userData'), 'license.enc'), cipher), accountsUsed);
+  await license.load();
+  const licenseState = () => licenseSuspended
+    ? { ...license.state(), allowed: false, status: 'blocked' as const, message: 'Ліцензію видалено. Виконання зупинено.' }
+    : license.state();
+  function requireLicense(count = accountsUsed()) {
+    if (licenseSuspended) throw new Error('Ліцензію видалено. Виконання зупинено.');
+    license.assertAccess(count);
+  }
   const window = new BrowserWindow({
     width: 1160, height: 850, minWidth: 850, minHeight: 650,
     title: 'NBU Desktop', backgroundColor: '#f1f0ec',
@@ -98,6 +125,7 @@ async function boot(): Promise<void> {
     notify, busy,
     (message) => dialog.showErrorBox('Планувальник зупинено', message),
     () => atomicClock.current(),
+    () => licenseState().allowed,
   );
 
   function handle(channel: string, handler: (input: unknown) => unknown) {
@@ -108,10 +136,31 @@ async function boot(): Promise<void> {
     });
   }
 
-  handle('state', () => ({ tasks: store.tasks(), settings: store.settings(), hasApiKey: !!apiKey,
+  handle('state', () => ({ tasks: store.tasks(), settings: store.settings(), license: licenseState(), hasApiKey: !!apiKey,
     savedApiKey, secretStorageAvailable: keyStore.available(), secretError,
     nbuAccounts: accountStore.emails(), accountsError,
     offsetHistoryByProfile: summarizeOffsetHistoryByProfile(store.tasks()), clockSync: atomicClock.last() }));
+  handle('activate-license', input => {
+    const generation = licenseGeneration;
+    return changeSettings(async () => {
+      await license.activate(z.string().max(64).parse(input));
+      if (generation === licenseGeneration) { licenseSuspended = false; scheduler.start(); }
+    });
+  });
+  handle('check-license', () => license.check());
+  handle('clear-license', () => {
+    licenseGeneration++;
+    licenseSuspended = true;
+    const stopped = scheduler.cancelAll('Завдання скасовано: ліцензію видалено.');
+    void stopped.catch(() => {});
+    return changeSettings(async () => {
+      await behaviorTests.beforePurchase(() => stopped);
+      await license.clear();
+      cabinetCache.clear();
+      licenseSuspended = false;
+      scheduler.start();
+    }, true);
+  });
   const cabinetCache = new CabinetCache();
   const cabinetStore = new CabinetStore(join(app.getPath('userData'), 'cabinet-cache.json'));
   handle('restore-cabinet', input => {
@@ -126,9 +175,9 @@ async function boot(): Promise<void> {
     return cabinetStore.save(connection, store.settings().savedProfiles.map(p => p.id), parsed);
   });
   let settingsWrites: Promise<unknown> = Promise.resolve();
-  function changeSettings(action: () => Promise<void>): Promise<void> {
+  function changeSettings(action: () => Promise<void>, allowRunning = false): Promise<void> {
     const operation = settingsWrites.then(async () => {
-      if (scheduler.hasRunningWork()) throw new Error('Зупиніть активне виконання перед зміною підключення.');
+      if (!allowRunning && scheduler.hasRunningWork()) throw new Error('Зупиніть активне виконання перед зміною підключення.');
       const previousConnection = JSON.stringify([store.settings().apiUrl, apiKey]);
       await action();
       if (JSON.stringify([store.settings().apiUrl, apiKey]) !== previousConnection) cabinetCache.clear();
@@ -145,6 +194,7 @@ async function boot(): Promise<void> {
       secretError = undefined;
     }
     await store.saveSettings(settingsSchema.parse(parsed));
+    await license.check().catch(() => {});
   }));
   handle('clear-api-key', () => changeSettings(async () => {
     await keyStore.clear();
@@ -170,6 +220,7 @@ async function boot(): Promise<void> {
   const cabinetProfile = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
   const behaviorTests = new BehaviorTests();
   handle('test-behavior', input => {
+    requireLicense();
     const { profileId, navigate, showCursor, minutes } = z.object({ profileId: cabinetProfile, navigate: z.boolean(),
       showCursor: z.boolean().default(false), minutes: z.number().int().min(1).max(60) }).parse(input);
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
@@ -179,6 +230,7 @@ async function boot(): Promise<void> {
   });
   handle('stop-behavior-test', input => { behaviorTests.stop(cabinetProfile.parse(input)); });
   function cabinetRequest<T>(profileId: string, key: string, read: (reader: CabinetReader, signal: AbortSignal) => Promise<T>, openProfile = true): Promise<T> {
+    requireLicense();
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
     return cabinetCache.get(JSON.stringify([profileId, key, openProfile]), () => scheduler.readProfile(profileId, signal => {
       const reader = new CabinetReader(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, openProfile);
@@ -220,19 +272,23 @@ async function boot(): Promise<void> {
   });
   handle('add-task', input => {
     const parsed = taskInputSchema.parse(input);
+    requireLicense(accountsUsed([parsed.profileId]));
     return behaviorTests.beforePurchase(() => scheduler.add(parsed));
   });
   handle('add-tasks', input => {
     const parsed = z.array(taskInputSchema).min(1).max(200).parse(input);
+    requireLicense(accountsUsed(parsed.map(task => task.profileId)));
     return behaviorTests.beforePurchase(() => scheduler.addMany(parsed));
   });
   handle('cancel-task', (input) => scheduler.cancel(z.string().uuid().parse(input)));
   handle('update-task', (input) => {
+    requireLicense();
     const parsed = z.object({ id: z.string().uuid(), url: z.string().max(2048),
       saleAt: z.number().int().positive().max(8_640_000_000_000_000) }).parse(input);
     return behaviorTests.beforePurchase(() => scheduler.update(parsed.id, parsed));
   });
   handle('inspect-profile', (input) => {
+    requireLicense();
     const parsed = z.object({
       profileId: z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),
       url: z.string().max(2048).transform(productUrl),
@@ -258,6 +314,8 @@ async function boot(): Promise<void> {
         if (result.response === 0) { closingDialog = false; return; }
       }
       await scheduler.stop();
+      await license.stop();
+      atomicClock.stop();
       await cabinetStore.flush();
       busy(false);
       quitting = true;
@@ -268,5 +326,7 @@ async function boot(): Promise<void> {
     if (!quitting) { event.preventDefault(); app.quit(); }
   });
   await window.loadFile(join(__dirname, 'index.html'));
+  if (license.state().status === 'unlicensed') await scheduler.cancelAll('Завдання скасовано: немає активованої ліцензії.');
+  license.start();
   scheduler.start();
 }

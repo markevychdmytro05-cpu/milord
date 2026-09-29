@@ -9,6 +9,7 @@ import { summarizeSales } from '../core/sale-summary';
 import { Cabinet } from './cabinet';
 import { NbuAccountEditor, NbuAccountToggle } from './nbu-account';
 import { BehaviorTest } from './behavior-test';
+import { LicensePanel } from './license-panel';
 
 declare global { interface Window { desktop: DesktopApi } }
 
@@ -560,6 +561,9 @@ function App() {
     </header>
     {state?.secretError && <div className="banner" role="alert">{state.secretError}</div>}
     {state?.accountsError && <div className="banner" role="alert">{state.accountsError}</div>}
+    {state && !state.license.allowed && tab !== 'settings' && <div className="banner" role="alert">
+      {state.license.message} <button type="button" className="link" onClick={() => setTab('settings')}>Відкрити налаштування ліцензії</button>
+    </div>}
 
     <div id="panel-tasks" role="tabpanel" aria-labelledby="tab-tasks" hidden={tab !== 'tasks'}>
       <div className="workspace">
@@ -614,14 +618,14 @@ function App() {
 
             {profiles.length > 0 && (profiles.length > 1 || extraUrls.length > 0) && <p className="summary">Буде створено {profiles.length * coinUrls.length} {plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}: {coinUrls.length} монет × {profiles.length} профілів.</p>}
             <div className="actions pair">
-              <button type="submit" disabled={busy || !state}>Запланувати</button>
-              <button type="button" className="ghost" disabled={busy || !state}
+              <button type="submit" disabled={busy || !state?.license.allowed}>Запланувати</button>
+              <button type="button" className="ghost" disabled={busy || !state?.license.allowed}
                 title="Відкриє профіль і перевірить, чи він бачить сторінку монети та чи виконано вхід. Нічого не купує."
                 onClick={inspect}>{inspecting || 'Перевірити профілі'}</button>
             </div>
           </form>
         </section>
-        <BehaviorTest profiles={options} now={now} />
+        <BehaviorTest profiles={options} now={now} enabled={!!state?.license.allowed} />
         </div>
 
         <section className="board" aria-labelledby="tasks-title">
@@ -665,11 +669,12 @@ function App() {
     </div>
 
     <div id="panel-cabinet" role="tabpanel" aria-labelledby="tab-cabinet" hidden={tab !== 'cabinet'}>
-      {state && <Cabinet key={state.settings.apiUrl} connection={state.settings.apiUrl} profiles={options} now={now} active={tab === 'cabinet'} />}
+      {state && <Cabinet key={state.settings.apiUrl} connection={state.settings.apiUrl} profiles={options} now={now} active={tab === 'cabinet'} enabled={state.license.allowed} />}
     </div>
 
     <div id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden={tab !== 'settings'}>
       <form noValidate onSubmit={saveSettings} className="settings">
+        <LicensePanel license={state?.license} refresh={async () => setState(await window.desktop.state())} />
         <section className="saved-profiles" aria-labelledby="saved-profiles-title">
           <div className="row-between"><h2 id="saved-profiles-title">Збережені профілі</h2>
             <button type="button" className="ghost" disabled={busy} onClick={() => {
