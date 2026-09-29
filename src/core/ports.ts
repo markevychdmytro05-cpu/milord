@@ -42,7 +42,10 @@ export interface ShopSession {
 }
 
 // Milliseconds from the start of the reload; serverDate is the response's Date header.
-export interface ReloadTiming { dnsMs?: number; connectMs?: number; requestMs?: number; ttfbMs?: number; httpStatus?: number; serverDate?: string }
+export interface ReloadTiming {
+  dnsMs?: number; connectMs?: number; requestMs?: number; ttfbMs?: number; httpStatus?: number; serverDate?: string;
+  elapsedMs?: number; timeoutMs?: number; outcome?: 'loaded' | 'timeout' | 'navigation-error' | 'rate-limited';
+}
 
 export interface CaptureRequest { label: string; saleDeltaMs: number; force?: boolean }
 

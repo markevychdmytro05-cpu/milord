@@ -27,6 +27,14 @@ export function reloadIntervalMs(elapsedMs: number, retrySec: number): number {
   return Math.max(base, tier);
 }
 
+// During the opening, a slow document already consumed part of the retry interval.
+// Keep at least 200 ms between completed loads; custom slower settings and later
+// backoff still wait their full interval. Never overlap requests or interrupt a load.
+export function reloadPauseMs(intervalMs: number, loadMs: number, elapsedMs: number, retrySec: number): number {
+  return retrySec === 1 && elapsedMs >= 0 && elapsedMs < 20_000
+    ? Math.max(200, intervalMs - Math.max(0, loadMs)) : intervalMs;
+}
+
 // A small spread so reloads do not tick at an exactly regular rhythm.
 export const RELOAD_JITTER = 0.1;
 export function jitterMs(ms: number, random = Math.random): number {
@@ -44,7 +52,9 @@ export async function runTask(
   let lastClickAt = 0;
   let watchUntil = 0;
   let nextReloadAt = 0;
+  let reloadStartedAt = 0;
   let observedPurchase = false;
+  let observedQueue = false;
   let recoveredAfterPurchase = false;
   let readyToBuy = false;
   let phase = 'перевірка запуску';
@@ -72,12 +82,20 @@ export async function runTask(
     void session?.capture?.({ label, saleDeltaMs: serverNow() - task.saleAt, force }).catch(() => {});
   };
   const observe = (state: PageState) => {
+    // A queue is owned by the shop and can take much longer than the purchase window.
+    // Keep observing even if its position is unchanged. If it disappears, allow time
+    // for the cart confirmation, but never submit this queued purchase again.
+    if (state.queuePosition && !state.inCart) {
+      observedQueue = true;
+      observedPurchase = true;
+      watchUntil = clock.now() + WATCH_AFTER_CLICK_MS;
+    }
     if (JSON.stringify(state) !== JSON.stringify(lastState)) {
       // Only explicit page flags are logged; no HTML, account fields or response bodies.
       record(describePage(state), Object.fromEntries(Object.entries(state).filter(([, value]) => value !== undefined)));
       lastState = { ...state };
       // After a click every recognized change is kept, even when the visible text stays the same.
-      if (task.clicks) capture(`state-${state.queuePosition ? 'queue' : state.inCart ? 'cart' : state.turnstile || state.challenge
+      if (task.clicks || observedQueue) capture(`state-${state.queuePosition ? 'queue' : state.inCart ? 'cart' : state.turnstile || state.challenge
         ? 'check' : state.purchasePending ? 'pending' : state.buyAvailable ? 'button' : 'other'}`, true);
     }
     return state;
@@ -96,6 +114,10 @@ export async function runTask(
   let startDeadline = task.saleAt;
   const startNow = () => atomicStart ? serverNow() : Math.min(clock.now(), serverNow());
   const reloadInterval = () => jitterMs(reloadIntervalMs(startNow() - task.saleAt, task.retrySec));
+  const scheduleReload = () => {
+    nextReloadAt = clock.now() + reloadPauseMs(reloadInterval(), clock.now() - reloadStartedAt,
+      startNow() - task.saleAt, task.retrySec);
+  };
 
   const update = async (status: TaskStatus, note: string) => {
     check();
@@ -194,7 +216,7 @@ export async function runTask(
           await update('in_cart', 'Монета вже в кошику. Завершіть оформлення у браузері.');
           return false;
         }
-        if (serverNow() >= saleDeadline()) {
+        if (clock.now() >= (watchUntil || saleDeadline() - task.offsetMs)) {
           await update(observedPurchase ? 'interrupted' : 'expired', observedPurchase
             ? 'Попереднє додавання не підтверджене. Перевірте кошик вручну; нову спробу не надіслано.'
             : 'Сторінка не готова до завершення вікна продажу.');
@@ -206,8 +228,11 @@ export async function runTask(
           await update('needs_attention', attentionNote(state, 'Увійдіть в акаунт НБУ та завершіть перевірку браузера.'));
         } else if (state.queuePosition) {
           await update('queued', `Черга: ${state.queuePosition}`);
+          capture('queue');
         } else if (state.purchasePending) {
           await update('firing', 'Магазин уже обробляє додавання. Очікуємо результат без нових натискань.');
+        } else if (observedQueue) {
+          await update('firing', 'Черга більше не відображається. Очікуємо підтвердження кошика без повторного натискання.');
         } else if (observedPurchase) {
           await update('interrupted', 'Попереднє додавання завершило очікування без підтвердження. Перевірте кошик вручну.');
           return false;
@@ -341,11 +366,15 @@ export async function runTask(
       check();
       phase = 'стартове оновлення сторінки';
       record(readyToBuy ? 'Оновлення: вкладка не була підготовлена.' : 'Оновлення: на старті кнопка недоступна.');
+      reloadStartedAt = clock.now();
       const timing = await session.reload();
-      task.startLoadedMs ??= serverNow() - task.saleAt;
-      record('Стартове оновлення завершено.', timing ? { ...timing } : {});
+      if (!timing?.outcome || timing.outcome === 'loaded') task.startLoadedMs ??= serverNow() - task.saleAt;
+      record(timing?.outcome === 'timeout' ? 'Стартове оновлення: час завантаження вичерпано.'
+        : timing?.outcome === 'navigation-error' ? 'Стартове оновлення: помилка завантаження.'
+        : timing?.outcome === 'rate-limited' ? 'Стартове оновлення відкладено через 429.'
+        : 'Стартове оновлення завершено.', timing ? { ...timing } : {});
     } else record('Підготовлена кнопка доступна; стартове оновлення пропущено.');
-    nextReloadAt = clock.now() + reloadInterval();
+    scheduleReload();
     let detectImmediately = true;
     let awaitingVerification = false;
 
@@ -389,12 +418,18 @@ export async function runTask(
       if (state.queuePosition) {
         awaitingVerification = false;
         await update('queued', `Черга: ${state.queuePosition}`);
+        capture('queue');
         await wait();
         continue;
       }
       if (state.purchasePending) {
         awaitingVerification = false;
         await update('firing', 'Магазин обробляє додавання в кошик. Очікуємо підтвердження.');
+        await wait();
+        continue;
+      }
+      if (observedQueue) {
+        await update('firing', 'Черга більше не відображається. Очікуємо підтвердження кошика без повторного натискання.');
         await wait();
         continue;
       }
@@ -448,9 +483,13 @@ export async function runTask(
         check();
         phase = 'повторне оновлення сторінки';
         record('Повторне оновлення: кнопка недоступна, інтервал очікування минув.');
+        reloadStartedAt = clock.now();
         const timing = await session.reload();
-        record('Повторне оновлення завершено.', timing ? { ...timing } : {});
-        nextReloadAt = clock.now() + reloadInterval();
+        record(timing?.outcome === 'timeout' ? 'Повторне оновлення: час завантаження вичерпано.'
+          : timing?.outcome === 'navigation-error' ? 'Повторне оновлення: помилка завантаження.'
+          : timing?.outcome === 'rate-limited' ? 'Повторне оновлення відкладено через 429.'
+          : 'Повторне оновлення завершено.', timing ? { ...timing } : {});
+        scheduleReload();
         detectImmediately = true;
       } else if (!task.clicks) {
         await update('firing', `Очікуємо кнопку. Оновлень: ${task.reloads}; локальне стеження без запитів.`);

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runTask, reloadIntervalMs, jitterMs, CLICK_COOLDOWN_MS, MAX_CLICKS, SALE_START_MARGIN_MS } from '../src/core/buyer';
+import { runTask, reloadIntervalMs, jitterMs, CLICK_COOLDOWN_MS, MAX_CLICKS, SALE_START_MARGIN_MS, WATCH_AFTER_CLICK_MS } from '../src/core/buyer';
 import { CLOCK_SYNC_MAX_AGE_MS, type ClockSync } from '../src/core/clock-sync';
 import { fakeBrowser, FakeClock, ready, task } from './helpers';
 
@@ -61,6 +61,70 @@ describe('purchase workflow', () => {
     expect(browser.clicks).toHaveLength(1);
     expect(browser.reloads).toHaveLength(1);
     expect(input.events.some((event) => event.message === 'Черга: 12')).toBe(true);
+  });
+
+  it('keeps an unchanged queue active for ten minutes and records its later progress and cart', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      queuePosition: browser.clicks.length ? (clock.now() < 1_600_000 ? '17336' : '12') : '',
+      purchasePending: browser.clicks.length > 0,
+      inCart: clock.now() >= 1_630_000,
+    }));
+    const capture = vi.fn(async () => {});
+    browser.session.capture = capture;
+    const input = task();
+    await runTask(input, browser.provider, clock, new AbortController().signal, async saved => {
+      if (clock.now() >= 1_120_000 && clock.now() < 1_630_000) expect(saved.status).toBe('queued');
+    });
+    expect(input.status).toBe('in_cart');
+    expect(input.cartMs).toBe(630_000);
+    expect(browser.clicks).toHaveLength(1);
+    expect(browser.reloads).toHaveLength(1);
+    expect(input.events.some(event => event.message === 'Черга: 12' && event.at === 1_600_000)).toBe(true);
+    expect(capture).toHaveBeenCalledWith({ label: 'state-queue', saleDeltaMs: 600_000, force: true });
+    expect(capture).toHaveBeenCalledWith({ label: 'final-in_cart', saleDeltaMs: 630_000, force: true });
+  });
+
+  it.each([true, false])('waits for confirmation after a long queue disappears, confirmed: %s', async confirmed => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      queuePosition: browser.clicks.length && clock.now() < 1_300_000 ? '12' : '',
+      inCart: confirmed && clock.now() >= 1_310_000,
+    }));
+    const input = task();
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe(confirmed ? 'in_cart' : 'interrupted');
+    expect(browser.clicks).toHaveLength(1);
+    expect(browser.reloads).toHaveLength(1);
+    expect(clock.now()).toBe(confirmed ? 1_310_000 : 1_299_000 + WATCH_AFTER_CLICK_MS);
+  });
+
+  it('allows cancellation while a long queue is still active', async () => {
+    const clock = new FakeClock();
+    const controller = new AbortController();
+    const browser = fakeBrowser(clock, () => {
+      if (clock.now() >= 1_300_000) controller.abort();
+      return { ...ready, queuePosition: browser.clicks.length ? '12' : '' };
+    });
+    const input = task();
+    await runTask(input, browser.provider, clock, controller.signal, async () => {});
+    expect(input.status).toBe('cancelled');
+    expect(browser.clicks).toHaveLength(1);
+    expect(browser.reloads).toHaveLength(1);
+    expect(browser.disconnected()).toBe(true);
+  });
+
+  it('observes an existing queue beyond the sale window without submitting another purchase', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      queuePosition: clock.now() < 1_300_000 ? '12' : '',
+      inCart: clock.now() >= 1_310_000,
+    }));
+    const input = task();
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toHaveLength(0);
+    expect(browser.reloads).toHaveLength(0);
   });
 
   it('waits for manual challenge completion before clicking', async () => {
@@ -165,11 +229,48 @@ describe('purchase workflow', () => {
     expect(browser.reloads[0]).toBe(1_010_000);
     for (let i = 1; i < browser.reloads.length; i++) {
       const loadedAt = browser.reloads[i - 1]! + 250;
-      expect(browser.reloads[i]! - loadedAt).toBe(reloadIntervalMs(loadedAt - 1_010_000, 1));
+      const elapsed = loadedAt - 1_010_000;
+      expect(browser.reloads[i]! - loadedAt).toBe(elapsed >= 5000 && elapsed < 20_000 ? 750 : reloadIntervalMs(elapsed, 1));
     }
     expect(browser.reloads.slice(0, 3)).toEqual([1_010_000, 1_010_450, 1_010_900]);
     // The old fixed 1 s cadence made ~240 full reloads here. The 200 ms opening burst adds ~10 in its first 5 s.
     expect(browser.reloads.length).toBeLessThan(70);
+  });
+
+  it.each([1, 5])('credits slow opening loads only for the default retry interval: %s s', async retrySec => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      buyAvailable: browser.reloads.length >= 3, inCart: browser.clicks.length > 0,
+    }));
+    const reload = browser.session.reload;
+    browser.session.reload = async () => { await reload(); clock.time += 5000; };
+    const input = task({ retrySec });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(browser.reloads).toEqual(retrySec === 1 ? [1_000_000, 1_005_200, 1_010_400] : [1_000_000, 1_010_000, 1_020_000]);
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toHaveLength(1);
+  });
+
+  it('reports a timed-out start load without claiming that the page was loaded', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      buyAvailable: browser.reloads.length > 1, inCart: browser.clicks.length > 0,
+    }));
+    const reload = browser.session.reload;
+    browser.session.reload = async () => {
+      await reload();
+      if (browser.reloads.length === 1) {
+        clock.time += 10_000;
+        return { outcome: 'timeout', elapsedMs: 10_000, timeoutMs: 10_000 };
+      }
+      return { outcome: 'loaded', elapsedMs: 100, httpStatus: 200 };
+    };
+    const input = task({ retrySec: 1 });
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(input.startLoadedMs).toBeUndefined();
+    expect(input.events.some(event => event.message.includes('час завантаження вичерпано') && event.details?.outcome === 'timeout')).toBe(true);
   });
 
   it('expires without clicking if the machine wakes after the sale window', async () => {
@@ -230,8 +331,8 @@ describe('verification at preparation and the sale boundary', () => {
       });
       const input = task({ saleAt: 1_010_000, mode: 'observe' });
       await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
-      expect(browser.reloads).toEqual([1_014_000]);
-      expect(input.status).toBe('observed');
+      expect(browser.reloads).toEqual(condition === 'queue' ? [] : [1_014_000]);
+      expect(input.status).toBe(condition === 'queue' ? 'interrupted' : 'observed');
     });
 
   it('expires without a time probe, refresh or click if a preparation widget never clears', async () => {

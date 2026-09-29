@@ -5,6 +5,8 @@
 //   skewMs: the fake shop's clock minus real time. overload: 503, a 25 s hang, then slow pages.
 //   drop: the first 8 connections are cut. slow: every page after the start takes 4 s.
 //   hang: the first request after the start is never answered, the rest take 1 s. atomicOffsetMs: pass the SNTP reading to the buyer.
+//   delayed: the shop publishes the button 2 s after the scheduled sale; checks repeated reloads.
+import assert from 'node:assert/strict';
 import { build } from 'esbuild';
 import https from 'node:https';
 import { readFileSync, mkdtempSync } from 'node:fs';
@@ -22,6 +24,7 @@ const DROP = process.argv[3] === 'drop';
 const SLOW = process.argv[3] === 'slow';
 const HANG = process.argv[3] === 'hang';
 const CRASH = process.argv[3] === 'crash'; // the coin's tab dies 3 s before the sale; the scheduler must recover
+const DELAYED = process.argv[3] === 'delayed';
 let afterStart = 0;
 await build({ stdin: { contents: `export { AdsPowerProvider, PreparationGate } from './src/browser/adspower';
   export { runTask } from './src/core/buyer'; export { Scheduler } from './src/main/scheduler'; export { Store } from './src/main/store'; export { realClock } from './src/core/ports'; export { ShopRequestGuard } from './src/core/shop-errors';`,
@@ -43,7 +46,7 @@ const server = https.createServer({ key: readFileSync('.local-data/rh-key.pem'),
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   if (req.url.startsWith('/__click')) { log.push({ kind: 'CLICK', atServer: now - saleAt, atReal: Date.now() - saleAt, url: req.url }); res.statusCode = 204; return res.end(); }
   if (req.url.includes('p-1200')) {
-    const open = now >= saleAt;
+    const open = now >= saleAt + (DELAYED ? 2000 : 0);
     if (DROP && open && ++afterStart <= 8) {
       log.push({ kind: `request #${afterStart} → connection dropped`, atServer: now - saleAt, atReal: Date.now() - saleAt });
       return req.socket.destroy();
@@ -125,3 +128,13 @@ for (const e of log) console.log(`  ${e.kind.padEnd(20)} server T${e.atServer >=
 const j = task.events.filter(e => (e.details?.saleDeltaMs ?? -Infinity) >= -5000 || !e.details?.saleDeltaMs && e.at >= saleAt - 5000).map(e => `    journal ${String(e.details?.saleDeltaMs ?? '').padStart(6)}  ${e.message}${e.details?.clickMethod ? ' [' + e.details.clickMethod + ']' : ''}${e.details?.ttfbMs !== undefined ? ` [request ${e.details.requestMs} ms, server ${e.details.ttfbMs} ms, HTTP ${e.details.httpStatus}]` : ''}`);
 console.log(j.join('\n'));
 console.log(`  button seen at T+${task.buttonSeenMs} (bot's server-time estimate), reloads before button: ${task.buttonReloads}, first click T+${task.firstClickMs}, cart T+${task.cartMs}`);
+assert.equal(task.status, 'in_cart', 'The rehearsal must confirm the simulated cart');
+const clicks = log.filter(e => e.kind === 'CLICK');
+assert.equal(clicks.length, 1, 'Exactly one purchase click is expected');
+assert.ok(clicks[0].atServer >= (DELAYED ? 2000 : 0), 'Never click before the shop publishes the button');
+assert.ok(log.some(e => e.kind === 'page without button' && e.atServer < 0), 'Prepare the page before the sale');
+if (DELAYED) {
+  assert.ok(log.some(e => e.kind === 'page without button' && e.atServer >= 0), 'Exercise a sale refresh before the button appears');
+  assert.ok(task.reloads > 1, 'Keep refreshing until the delayed button appears');
+}
+console.log('PASS: prepared before sale, detected the button, clicked once, confirmed cart.');

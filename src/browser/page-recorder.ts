@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { appendFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { Page, Response } from 'patchright-core';
+import type { Page, Request, Response } from 'patchright-core';
 import type { CaptureRequest } from '../core/ports';
 
 // Development aid: keeps what the shop showed around a purchase, so unseen markup (a moving queue,
@@ -42,6 +42,8 @@ export class TaskRecorder {
   private lastText = '';
   private lastAt = 0;
   private recordingNetwork = false;
+  private timings = 0;
+  private requests = new WeakMap<Request, { startedAt: number; headersAt?: number; status?: number }>();
   private ready?: Promise<void>;
   private queue: Promise<unknown> = Promise.resolve();
   constructor(readonly dir: string, private readonly saleAt: number, private readonly now: () => number) {}
@@ -54,6 +56,55 @@ export class TaskRecorder {
     const result = this.queue.then(action);
     this.queue = result.catch(() => {});
     return result;
+  }
+
+  // Passive browser events only. No intercepted requests, extra shop calls or response bodies.
+  // Separate event timestamps from disk-write time: a slow body must not move later events.
+  attach(page: Page): () => void {
+    const started = (request: Request) => { this.requests.set(request, { startedAt: this.now() }); };
+    const response = (response: Response) => {
+      const request = response.request();
+      this.requests.set(request, { startedAt: this.requests.get(request)?.startedAt ?? this.now(),
+        headersAt: this.now(), status: response.status() });
+      this.response(response);
+    };
+    const finished = (request: Request) => this.requestTiming(request, false);
+    const failed = (request: Request) => this.requestTiming(request, true);
+    page.on('request', started);
+    page.on('response', response);
+    page.on('requestfinished', finished);
+    page.on('requestfailed', failed);
+    return () => {
+      page.off('request', started); page.off('response', response);
+      page.off('requestfinished', finished); page.off('requestfailed', failed);
+    };
+  }
+
+  private requestTiming(request: Request, failed: boolean): void {
+    if (!this.recordingNetwork || this.timings >= MAX_NETWORK || this.bytes >= MAX_BYTES) return;
+    let url: URL;
+    try { url = new URL(request.url()); } catch { return; }
+    const type = request.resourceType();
+    const shop = url.origin === 'https://coins.bank.gov.ua' && ['document', 'xhr', 'fetch', 'script'].includes(type);
+    const asset = type === 'script' && (url.origin === 'https://cdn-nbu.solomono.net' ||
+      url.origin === 'https://challenges.cloudflare.com' && url.pathname === '/turnstile/v0/api.js');
+    if (!shop && !asset) return;
+    this.timings++;
+    const at = this.now();
+    const meta = this.requests.get(request);
+    let timing: ReturnType<Request['timing']> | undefined;
+    try { timing = request.timing(); } catch { /* Browser may have disconnected. */ }
+    const action = url.searchParams.get('action');
+    const row = JSON.stringify({ at: new Date(at).toISOString(), saleDeltaMs: at - this.saleAt,
+      url: url.origin + url.pathname, ...(action && /^[a-z_]{1,50}$/.test(action) ? { action } : {}),
+      type, method: request.method(), outcome: failed ? 'failed' : 'finished', ...meta, timing,
+      ...(failed ? { failure: request.failure()?.errorText?.match(/net::ERR_[A-Z_]+/)?.[0] ?? 'request-failed' } : {}),
+    });
+    void this.serial(async () => {
+      await this.prepare();
+      await appendFile(join(this.dir, 'request-timings.jsonl'), `${row}\n`, { mode: 0o600 });
+      this.bytes += row.length;
+    }).catch(() => {});
   }
 
   // Saves the page when its visible text changed. Throttled: at most once a second in the first
@@ -88,11 +139,13 @@ export class TaskRecorder {
     if (!['xhr', 'fetch'].includes(request.resourceType())) return;
     try { if (new URL(response.url()).origin !== 'https://coins.bank.gov.ua') return; } catch { return; }
     this.network++;
+    const receivedAt = this.now();
     void this.serial(async () => {
       let body = '';
       try { body = (await response.text()).slice(0, BODY_LIMIT); } catch { body = '[тіло недоступне]'; }
       const line = JSON.stringify({
-        at: new Date(this.now()).toISOString(), saleDeltaMs: this.now() - this.saleAt,
+        at: new Date(receivedAt).toISOString(), saleDeltaMs: receivedAt - this.saleAt,
+        recordedAt: new Date(this.now()).toISOString(),
         method: request.method(), url: response.url(), status: response.status(),
         contentType: response.headers()['content-type'] ?? '', requestBody: (request.postData() ?? '').slice(0, 4096), body,
       });

@@ -1,6 +1,7 @@
 import { mkdtemp, readdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import type { Page, Response } from 'patchright-core';
 import { describe, expect, it } from 'vitest';
 import { PageRecorder } from '../src/browser/page-recorder';
@@ -19,6 +20,56 @@ const fakeResponse = (type: string, body: string) => ({
 }) as unknown as Response;
 
 describe('page recorder', () => {
+  it('timestamps responses when received, even if an earlier body delays the disk queue', async () => {
+    let now = 1_000_000;
+    const root = await mkdtemp(join(tmpdir(), 'nbu-captures-'));
+    const recorder = new PageRecorder(root, () => now).forTask('test', now);
+    const page = fakePage(() => 'page');
+    await recorder.snapshot(page, { label: 'start', saleDeltaMs: 0, force: true });
+    let release!: (value: string) => void;
+    const body = new Promise<string>(resolve => { release = resolve; });
+    recorder.response({ ...fakeResponse('xhr', ''), text: () => body } as unknown as Response);
+    now += 100;
+    recorder.response(fakeResponse('xhr', 'second'));
+    now += 5000;
+    release('first');
+    await recorder.snapshot(page, { label: 'flush', saleDeltaMs: 5100, force: true });
+    const rows = (await readFile(join(recorder.dir, 'network.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(rows.map(row => row.saleDeltaMs)).toEqual([0, 100]);
+    expect(rows[1].at).not.toBe(rows[1].recordedAt);
+  });
+
+  it('records document timings and failed requests without query secrets, and detaches listeners', async () => {
+    let now = 1_000_000;
+    const root = await mkdtemp(join(tmpdir(), 'nbu-captures-'));
+    const recorder = new PageRecorder(root, () => now).forTask('test', now);
+    const page = Object.assign(new EventEmitter(), fakePage(() => 'page'));
+    const detach = recorder.attach(page as unknown as Page);
+    await recorder.snapshot(page as unknown as Page, { label: 'start', saleDeltaMs: 0, force: true });
+    const request = {
+      url: () => 'https://coins.bank.gov.ua/product_info.php?action=prepare_buy&token=private-secret',
+      resourceType: () => 'document', method: () => 'GET',
+      timing: () => ({ startTime: 1_000_000, requestStart: 10, responseStart: 13010, responseEnd: 13020 }),
+      failure: () => ({ errorText: 'net::ERR_ABORTED private-secret' }),
+    };
+    page.emit('request', request);
+    now += 13010;
+    page.emit('response', { ...fakeResponse('document', ''), request: () => request });
+    now += 10;
+    page.emit('requestfinished', request);
+    page.emit('requestfailed', request);
+    await recorder.snapshot(page as unknown as Page, { label: 'flush', saleDeltaMs: 13020, force: true });
+    const text = await readFile(join(recorder.dir, 'request-timings.jsonl'), 'utf8');
+    const rows = text.trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ startedAt: 1_000_000, headersAt: 1_013_010, status: 200,
+      outcome: 'finished', action: 'prepare_buy', timing: { responseStart: 13010, responseEnd: 13020 } });
+    expect(rows[1]).toMatchObject({ outcome: 'failed', failure: 'net::ERR_ABORTED' });
+    expect(text).not.toContain('private-secret');
+    detach();
+    expect(page.eventNames()).toEqual([]);
+  });
+
   it('saves a page only when its text changes, and the page’s own XHR once recording started', async () => {
     let now = 1_000_000;
     const root = await mkdtemp(join(tmpdir(), 'nbu-captures-'));

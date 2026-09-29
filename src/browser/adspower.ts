@@ -251,6 +251,7 @@ export class AdsPowerProvider implements BrowserProvider {
     signal.throwIfAborted();
     let browser: Browser | undefined;
     const listeners: Array<{ page: Page; handler: (response: Response) => void }> = [];
+    const detachRecorders: Array<() => void> = [];
     const offsets = new Map<Page, number>();
     const offsetBounds = new Map<Page, OffsetBounds>();
     const navigationStatuses = new Map<Page, number>();
@@ -428,11 +429,7 @@ export class AdsPowerProvider implements BrowserProvider {
             }, realClock, taskSignal, until);
           };
           const recording = taskOptions?.capture && this.recorder?.forTask(taskOptions.capture.taskId, taskOptions.capture.saleAt);
-          if (recording) {
-            const handler = (response: Response) => recording.response(response);
-            page.on('response', handler);
-            listeners.push({ page, handler });
-          }
+          if (recording) detachRecorders.push(recording.attach(page));
           // Under heavy load a read can land exactly while the document is being replaced, a reload can
           // outlast its timeout, and a dropped connection leaves Chrome's own error page in the tab. None
           // of these is a reason to give up the sale: the buyer sees "no button yet" and reloads on schedule.
@@ -501,9 +498,10 @@ export class AdsPowerProvider implements BrowserProvider {
             serverOffsetBounds: async () => { check(); return offsetBounds.get(page); },
             reload: async () => {
               check(); onTarget();
-              if (this.guard.isBlocked()) return; // The buyer will enter the shared recovery loop.
+              if (this.guard.isBlocked()) return { outcome: 'rate-limited', elapsedMs: 0 }; // The buyer will enter recovery.
               const timeout = Math.min(25_000, 10_000 + reloadTimeouts * 5000);
-              let timing: ReloadTiming | undefined;
+              const startedAt = Date.now();
+              let timing: ReloadTiming = { outcome: 'loaded', timeoutMs: timeout };
               try {
                 // Chrome's error page cannot be reloaded into the shop: open the coin's address again.
                 navigationSentAt.set(page, Date.now());
@@ -511,16 +509,17 @@ export class AdsPowerProvider implements BrowserProvider {
                   : await page.reload({ waitUntil: 'domcontentloaded', timeout });
                 if (response) { observeResponse(page, response); navigationStatuses.set(page, response.status()); }
                 reloadTimeouts = 0;
-                if (response) timing = reloadTiming(response);
+                if (response) timing = { ...timing, ...reloadTiming(response) };
               } catch (error) {
                 if (!transient(error)) throw error;
-                if (error instanceof Error && /Timeout/i.test(error.message)) { reloadTimeouts++; await stopLoading(); }
+                timing.outcome = error instanceof Error && /Timeout/i.test(error.message) ? 'timeout' : 'navigation-error';
+                if (timing.outcome === 'timeout') { reloadTimeouts++; await stopLoading(); }
                 navigationStatuses.delete(page); // Unanswered or dropped: no status to report.
               }
               void prepareClickWorld(cdp).catch(() => {}); // The reload destroyed the previous world.
               renewWarmth();
               check(); // The buyer reads the fresh page next; a second read here only delays the click.
-              return timing;
+              return { ...timing, elapsedMs: Date.now() - startedAt };
             },
             login: async () => {
               check(); assertShopPage(page, target);
@@ -585,11 +584,13 @@ export class AdsPowerProvider implements BrowserProvider {
           if (disconnected) return;
           disconnected = true;
           for (const { page, handler } of listeners) page.off('response', handler);
+          for (const detach of detachRecorders) detach();
           await connection.close(); // Disconnect CDP only; leave the user's browser and tabs open.
         },
       };
     } catch (error) {
       for (const { page, handler } of listeners) page.off('response', handler);
+      for (const detach of detachRecorders) detach();
       await browser?.close().catch(() => {});
       throw error;
     }
