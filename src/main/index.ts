@@ -82,7 +82,7 @@ async function boot(): Promise<void> {
   }
   const window = new BrowserWindow({
     width: 1160, height: 850, minWidth: 850, minHeight: 650,
-    title: 'NBU Desktop', backgroundColor: '#f1f0ec',
+    title: 'Numis', backgroundColor: '#f1f0ec',
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'), nodeIntegration: false,
       contextIsolation: true, sandbox: true,
@@ -108,7 +108,7 @@ async function boot(): Promise<void> {
   };
   const notify = (task: Task) => {
     if ((isFinal(task.status) || task.status === 'needs_attention') && Notification.isSupported()) {
-      new Notification({ title: 'NBU Desktop', body: task.note }).show();
+      new Notification({ title: 'Numis', body: task.note }).show();
     }
   };
   const profileStartGate = new ProfileStartGate();
@@ -306,7 +306,7 @@ async function boot(): Promise<void> {
     void (async () => {
       if (scheduler.hasActiveWork()) {
         const result = await dialog.showMessageBox(window, {
-          type: 'question', title: 'Закрити NBU Desktop?',
+          type: 'question', title: 'Закрити Numis?',
           message: 'Виконання активних завдань зупиниться.',
           detail: 'Заплановані завдання збережено. Уже надіслане додавання в кошик не скасовується.',
           buttons: ['Залишити відкритою', 'Закрити'], defaultId: 0, cancelId: 0,

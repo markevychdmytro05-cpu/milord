@@ -312,7 +312,7 @@ function App() {
       const previous = next.settings.defaultProfileIds.length ? next.settings.defaultProfileIds
         : next.settings.defaultProfileId ? [next.settings.defaultProfileId] : [];
       setSelected(previous.filter((id) => next.settings.savedProfiles.some((profile) => profile.id === id)));
-    }).catch(() => { if (alive) setNotice({ kind: 'error', text: 'Не вдалося прочитати стан програми. Перезапустіть NBU Desktop.' }); });
+    }).catch(() => { if (alive) setNotice({ kind: 'error', text: 'Не вдалося прочитати стан програми. Перезапустіть Numis.' }); });
     const interval = setInterval(() => {
       setNow(Date.now());
       void window.desktop.state().then((next) => { if (alive) setState(next); }).catch(() => {});
@@ -388,7 +388,7 @@ function App() {
         url: coinUrl.trim(), profileId, saleAt: saleAtMs, leadMin, retrySec, windowMin, mode: 'cart' as const,
       }))));
       setTaskView('active');
-      setNotice({ kind: 'ok', text: `Заплановано: ${profiles.length * coinUrls.length} ${plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}. Залиште NBU Desktop і AdsPower відкритими.` });
+      setNotice({ kind: 'ok', text: `Заплановано: ${profiles.length * coinUrls.length} ${plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}. Залиште Numis і AdsPower відкритими.` });
       setUrl(''); setExtraUrls([]); setErrors({});
       // Remember the last used profiles; this is best-effort and must never fail the scheduling.
       if (profiles.length <= 50 && profiles.join() !== defaultProfileIds.join()) {
@@ -534,7 +534,7 @@ function App() {
 
   return <div className="app">
     <aside className="side">
-      <div className="brand"><span className="mark" aria-hidden="true">N</span><span className="brand-name">NBU Desktop</span></div>
+      <div className="brand"><span className="mark" aria-hidden="true">N</span><span className="brand-name">Numis</span></div>
       <nav aria-label="Розділи додатка"><div role="tablist" aria-orientation="vertical">
         {NAV_TABS.map((name) => <button key={name} id={`tab-${name}`} role="tab" type="button"
           aria-selected={tab === name} aria-controls={`panel-${name}`} tabIndex={tab === name ? 0 : -1}
