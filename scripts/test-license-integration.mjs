@@ -17,6 +17,9 @@ const desktopData = join(root, 'desktop');
 const fixture = JSON.parse((await execute('python3', ['-c',
   'import sqlite3,json,sys; source=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); dest=sqlite3.connect(sys.argv[2]); source.backup(dest); row=dest.execute("select id,key,max_accounts from licenses where status=\'active\' and expires_at is null order by id limit 1").fetchone(); assert row, "Need an active lifetime demo license for isolated integration"; dest.execute("delete from license_activations where license_id=?",(row[0],)); dest.commit(); print(json.dumps(dict(id=row[0],key=row[1],maxAccounts=row[2])))',
   join(serverRoot, 'database/database.sqlite'), database])).stdout);
+await execute('php', ['artisan', 'migrate', '--force', '--no-interaction'], {
+  cwd: serverRoot, env: { ...process.env, APP_ENV: 'local', DB_CONNECTION: 'sqlite', DB_DATABASE: database },
+});
 const publicKey = (await execute('php', ['-r',
   'require "vendor/autoload.php"; $app = require "bootstrap/app.php"; $app->make(Illuminate\\Contracts\\Console\\Kernel::class)->bootstrap(); echo base64_encode(sodium_crypto_sign_publickey_from_secretkey(base64_decode(config("license.signing_secret_key"), true)));'],
   { cwd: serverRoot })).stdout.trim();

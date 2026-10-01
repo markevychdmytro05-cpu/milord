@@ -70,8 +70,9 @@ async function boot(): Promise<void> {
     serverUrl: app.isPackaged ? __LICENSE_SERVER_URL__ : process.env.NBU_LICENSE_SERVER_URL || __LICENSE_SERVER_URL__,
     publicKey: app.isPackaged ? __LICENSE_PUBLIC_KEY__ : process.env.NBU_LICENSE_PUBLIC_KEY || __LICENSE_PUBLIC_KEY__,
     deviceId: await deviceId(join(app.getPath('userData'), 'license-device-id')),
-    deviceName: hostname(), appVersion: app.getVersion(), allowTestKey: __ALLOW_TEST_LICENSE__,
-  }, new KeyStore(join(app.getPath('userData'), 'license.enc'), cipher), accountsUsed);
+    deviceName: hostname(), appVersion: app.getVersion(), allowTestKey: !app.isPackaged && __ALLOW_TEST_LICENSE__,
+  }, new KeyStore(join(app.getPath('userData'), 'license.enc'), cipher),
+  new KeyStore(join(app.getPath('userData'), 'license-device-key.enc'), cipher), accountsUsed);
   await license.load();
   const licenseState = () => licenseSuspended
     ? { ...license.state(), allowed: false, status: 'blocked' as const, message: 'Ліцензію видалено. Виконання зупинено.' }

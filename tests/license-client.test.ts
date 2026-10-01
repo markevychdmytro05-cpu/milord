@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { LicenseClient, licenseServerUrl, TEST_LICENSE_KEY } from '../src/main/license-client';
 import type { LicenseConfig } from '../src/main/license-client';
@@ -7,38 +7,50 @@ const pair = generateKeyPairSync('ed25519');
 const publicKey = pair.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
 const KEY = 'ABCD-EFGH-JKLM-NPQR';
 const NOW = Date.parse('2026-09-29T14:00:00Z');
-const DEVICE = 'device-test-1234';
+const DEVICE = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 function fixture(options: Partial<LicenseConfig> = {}) {
-  let now = NOW, count = 2, saved = '';
+  let now = NOW, count = 2, saved = '', deviceSaved = '';
   let reply: (body: Record<string, unknown>) => Response = body => signed(body);
   const vault = {
     load: async () => ({ value: saved, saved: !!saved }),
     save: vi.fn(async (value: string) => { saved = value; }),
     clear: vi.fn(async () => { saved = ''; }),
   };
+  const deviceVault = {
+    load: async () => ({ value: deviceSaved, saved: !!deviceSaved }),
+    save: vi.fn(async (value: string) => { deviceSaved = value; }),
+  };
   const request = vi.fn(async (_url: unknown, init: RequestInit | undefined) => reply(JSON.parse(init!.body as string))) as unknown as typeof fetch;
   const config = { serverUrl: 'http://127.0.0.1:8000', publicKey, deviceId: DEVICE, deviceName: 'Test PC', appVersion: '0.1.0', ...options };
-  const make = () => new LicenseClient(config, vault, () => count, request, () => now);
-  return { client: make(), make, vault, request, saved: () => saved,
+  const make = () => new LicenseClient(config, vault, deviceVault, () => count, request, () => now);
+  return { client: make(), make, vault, deviceVault, request, saved: () => saved, savedDevice: () => deviceSaved,
     reply: (next: typeof reply) => { reply = next; }, clock: (next: number) => { now = next; }, usage: (next: number) => { count = next; } };
 }
 function signed(body: Record<string, unknown>, changes: Record<string, unknown> = {}, status = 200): Response {
   const data = JSON.stringify({ success: true, error: null,
     license: { id: 1, max_accounts: 5, max_devices: 1, expires_at: null },
     server_time: new Date(NOW).toISOString(), valid_until: new Date(NOW + 72 * 3600_000).toISOString(),
-    device_id: body.device_id, nonce: body.nonce, ...changes });
+    device_id: body.device_id, device_public_key: body.device_public_key, nonce: body.nonce, ...changes });
   return Response.json({ data, signature: sign(null, Buffer.from(data), pair.privateKey).toString('base64') }, { status });
 }
 
 describe('license integration contract', () => {
-  it('blocks before activation; activates with a nonce, usage, and no key returned to the renderer', async () => {
+  it('blocks before activation; activates with signed device proof and no key returned to the renderer', async () => {
     const f = fixture();
     expect(() => f.client.assertAccess()).toThrow('Активуйте');
     await f.client.activate('abcdefghjklmnpqr');
     expect(f.client.state()).toMatchObject({ allowed: true, status: 'active', keySuffix: 'NPQR', maxAccounts: 5 });
     const [, init] = vi.mocked(f.request).mock.calls[0]!;
-    expect(JSON.parse(init!.body as string)).toMatchObject({ key: KEY, accounts_used: 2, device_id: DEVICE, app_version: '0.1.0' });
-    expect(JSON.parse(init!.body as string).nonce).toMatch(/^[a-f0-9]{48}$/);
+    const body = JSON.parse(init!.body as string);
+    expect(body).toMatchObject({ key: KEY, device_id: DEVICE, app_version: '0.1.0' });
+    expect(body).not.toHaveProperty('accounts_used');
+    expect(body.nonce).toMatch(/^[a-f0-9]{48}$/);
+    const devicePublicKey = createPublicKey({ key: Buffer.concat([
+      Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(body.device_public_key, 'base64'),
+    ]), format: 'der', type: 'spki' });
+    const proof = ['license-v2', 'activate', KEY, DEVICE, body.nonce, String(body.request_time),
+      body.device_public_key, 'Test PC', '0.1.0'].join('\n');
+    expect(verify(null, Buffer.from(proof), devicePublicKey, Buffer.from(body.device_signature, 'base64'))).toBe(true);
     expect(JSON.stringify(f.client.state())).not.toContain(KEY);
   });
   it('validates the cached signature on restart and permits only the remaining grace period', async () => {
@@ -47,6 +59,43 @@ describe('license integration contract', () => {
     expect(restored.state()).toMatchObject({ status: 'offline', allowed: true });
     f.clock(NOW + 72 * 3600_000);
     expect(restored.state()).toMatchObject({ status: 'expired', allowed: false });
+  });
+  it('rejects a copied grant without the original device key', async () => {
+    const f = fixture(); await f.client.activate(KEY);
+    const otherDeviceVault = { load: async () => ({ value: '', saved: false }), save: vi.fn(async () => {}) };
+    const copied = new LicenseClient({ serverUrl: 'http://127.0.0.1:8000', publicKey, deviceId: DEVICE,
+      deviceName: 'Test PC', appVersion: '0.1.0' }, f.vault, otherDeviceVault, () => 2, f.request, () => NOW);
+
+    await copied.load();
+
+    expect(copied.state().allowed).toBe(false);
+    expect(otherDeviceVault.save).toHaveBeenCalledOnce();
+  });
+  it('keeps the device key when the license is cleared and reactivated', async () => {
+    const f = fixture(); await f.client.activate(KEY);
+    const first = JSON.parse(vi.mocked(f.request).mock.calls[0]![1]!.body as string);
+    const savedKey = f.savedDevice();
+
+    await f.client.clear(); await f.client.activate(KEY);
+
+    const second = JSON.parse(vi.mocked(f.request).mock.calls[1]![1]!.body as string);
+    expect(second.device_public_key).toBe(first.device_public_key);
+    expect(f.savedDevice()).toBe(savedKey);
+    expect(f.deviceVault.save).toHaveBeenCalledOnce();
+  });
+  it('refreshes an older signed grant online without trusting it offline', async () => {
+    const f = fixture(); await f.client.activate(KEY);
+    const record = JSON.parse(f.saved());
+    const legacy = JSON.parse(record.envelope.data);
+    delete legacy.device_public_key;
+    record.envelope.data = JSON.stringify(legacy);
+    record.envelope.signature = sign(null, Buffer.from(record.envelope.data), pair.privateKey).toString('base64');
+    await f.vault.save(JSON.stringify(record));
+
+    const restored = f.make(); await restored.load();
+    expect(restored.state().allowed).toBe(false);
+    await restored.check();
+    expect(restored.state()).toMatchObject({ allowed: true, status: 'active' });
   });
   it('allows a network failure only while the signed grant is valid', async () => {
     const f = fixture(); await f.client.activate(KEY);
@@ -73,7 +122,7 @@ describe('license integration contract', () => {
     expect(restored.state().allowed).toBe(false);
   });
   it.each([
-    { nonce: 'replayed' }, { device_id: 'another-device' },
+    { nonce: 'replayed' }, { device_id: 'another-device' }, { device_public_key: 'another-key' },
     { valid_until: new Date(NOW + 73 * 3600_000).toISOString() },
     { license: { id: 1, max_accounts: 5, max_devices: 1, expires_at: new Date(NOW + 3600_000).toISOString() } },
     { server_time: new Date(NOW - 600_000).toISOString() },
@@ -113,7 +162,7 @@ describe('license integration contract', () => {
   it('cannot restore a server grant under a different server configuration', async () => {
     const f = fixture(); await f.client.activate(KEY);
     const changed = new LicenseClient({ serverUrl: 'http://localhost:8001', publicKey, deviceId: DEVICE,
-      deviceName: 'Test', appVersion: '0.1.0' }, f.vault, () => 2);
+      deviceName: 'Test', appVersion: '0.1.0' }, f.vault, f.deviceVault, () => 2);
     await changed.load(); expect(changed.state().allowed).toBe(false);
   });
   it('fails closed when secure persistence is unavailable', async () => {
@@ -132,7 +181,7 @@ describe('license integration contract', () => {
   it('a release with test access disabled rejects both activation and a cached test key', async () => {
     const f = fixture({ allowTestKey: true }); await f.client.activate(TEST_LICENSE_KEY);
     const release = new LicenseClient({ serverUrl: 'http://127.0.0.1:8000', publicKey, deviceId: DEVICE,
-      deviceName: 'Test', appVersion: '0.1.0', allowTestKey: false }, f.vault, () => 2, f.request);
+      deviceName: 'Test', appVersion: '0.1.0', allowTestKey: false }, f.vault, f.deviceVault, () => 2, f.request);
     await release.load(); expect(release.state().allowed).toBe(false);
     await expect(release.activate(TEST_LICENSE_KEY)).rejects.toThrow('вимкнено');
     expect(f.request).not.toHaveBeenCalled();

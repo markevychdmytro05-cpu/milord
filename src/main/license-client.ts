@@ -1,4 +1,4 @@
-import { createPublicKey, randomBytes, verify } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { z } from 'zod';
 import type { LicenseState } from '../core/license';
@@ -13,7 +13,7 @@ const envelopeSchema = z.object({ data: z.string().max(16_384), signature: z.str
 const limitsSchema = z.object({ id: z.number().int().positive(), max_accounts: z.number().int().nonnegative(),
   max_devices: z.number().int().nonnegative(), expires_at: z.iso.datetime({ offset: true }).nullable() });
 const payloadSchema = z.object({ success: z.boolean(), error: z.string().nullable(), license: limitsSchema.nullable(),
-  valid_until: z.iso.datetime({ offset: true }).optional(), device_id: z.string(), nonce: z.string().nullable(),
+  valid_until: z.iso.datetime({ offset: true }).optional(), device_id: z.string(), device_public_key: z.string(), nonce: z.string().nullable(),
   server_time: z.iso.datetime({ offset: true }) });
 type Envelope = z.infer<typeof envelopeSchema>;
 type Payload = z.infer<typeof payloadSchema>;
@@ -27,6 +27,8 @@ const errors: Record<string, string> = {
   license_expired: 'Термін ліцензії закінчився.', device_not_activated: 'Активуйте ключ на цьому пристрої.',
   device_limit_reached: 'Досягнуто ліміт пристроїв. Зверніться до адміністратора ліцензій.',
   accounts_limit_exceeded: 'Перевищено ліміт акаунтів. Зменште кількість збережених профілів або змініть тариф.',
+  device_key_mismatch: 'Ключ цього пристрою не збігається з активацією. Зверніться до адміністратора ліцензій.',
+  invalid_device_proof: 'Сервер не підтвердив ключ цього пристрою.',
 };
 export interface LicenseConfig { serverUrl: string; publicKey: string; deviceId: string; deviceName: string; appVersion: string; allowTestKey?: boolean; }
 
@@ -48,9 +50,10 @@ export class LicenseClient {
   private timer?: ReturnType<typeof setInterval>;
   private operations: Promise<unknown> = Promise.resolve();
   private checking?: Promise<void>;
+  private identity?: { privateKey: KeyObject; publicKey: string };
 
   constructor(private readonly config: LicenseConfig, private readonly vault: Pick<KeyStore, 'load' | 'save' | 'clear'>,
-    private readonly accountsUsed: () => number, private readonly request: typeof fetch = fetch,
+    private readonly deviceVault: Pick<KeyStore, 'load' | 'save'>, private readonly accountsUsed: () => number, private readonly request: typeof fetch = fetch,
     private readonly now: () => number = Date.now) {
     config.serverUrl = licenseServerUrl(config.serverUrl);
     const raw = Buffer.from(config.publicKey, 'base64');
@@ -69,8 +72,10 @@ export class LicenseClient {
         this.key = record.key; this.test = true; return;
       }
       if (record.serverUrl !== this.config.serverUrl) throw new Error('Server changed');
+      this.key = record.key;
+      await this.ensureIdentity();
       const payload = this.verify(record.envelope);
-      this.key = record.key; this.payload = payload;
+      this.payload = payload;
     } catch { this.problem = 'Збережена ліцензія не пройшла перевірку. Активуйте ключ повторно.'; }
   }
 
@@ -146,7 +151,8 @@ export class LicenseClient {
     const signature = Buffer.from(envelope.signature, 'base64');
     if (signature.length !== 64 || !verify(null, Buffer.from(envelope.data), this.publicKey, signature)) throw new Error('Signature');
     const payload = payloadSchema.parse(JSON.parse(envelope.data));
-    if (payload.device_id !== this.config.deviceId || (nonce !== undefined && payload.nonce !== nonce)) throw new Error('Request mismatch');
+    if (payload.device_id !== this.config.deviceId || payload.device_public_key !== this.identity?.publicKey ||
+        (nonce !== undefined && payload.nonce !== nonce)) throw new Error('Request mismatch');
     if (payload.success) {
       if (payload.error !== null || !payload.license || !payload.valid_until) throw new Error('Missing grant');
       const issued = Date.parse(payload.server_time), until = Date.parse(payload.valid_until);
@@ -157,13 +163,19 @@ export class LicenseClient {
     return payload;
   }
   private async call(action: 'activate' | 'check', key: string): Promise<{ envelope: Envelope; payload: Payload }> {
+    const identity = await this.ensureIdentity();
     const nonce = randomBytes(24).toString('hex');
+    const requestTime = Math.floor(this.now() / 1000);
+    const message = ['license-v2', action, key, this.config.deviceId, nonce, String(requestTime), identity.publicKey,
+      this.config.deviceName, this.config.appVersion].join('\n');
+    const deviceSignature = sign(null, Buffer.from(message), identity.privateKey).toString('base64');
     let response: Response;
     try {
       response = await this.request(`${this.config.serverUrl}/api/v1/license/${action}`, {
         method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ key, device_id: this.config.deviceId, device_name: this.config.deviceName,
-          app_version: this.config.appVersion, accounts_used: this.accountsUsed(), nonce }), signal: AbortSignal.timeout(10_000),
+          app_version: this.config.appVersion, nonce, request_time: requestTime, device_public_key: identity.publicKey,
+          device_signature: deviceSignature }), signal: AbortSignal.timeout(10_000),
       });
       if (response.status === 429 || response.status >= 500) throw new LicenseUnavailable();
     } catch { throw new LicenseUnavailable(); }
@@ -184,6 +196,25 @@ export class LicenseClient {
     try { await this.vault.save(JSON.stringify({ kind: 'server', key, serverUrl: this.config.serverUrl, envelope })); }
     catch { this.problem = 'Не вдалося зберегти ліцензію в системному сховищі.'; throw new Error(this.problem); }
     this.key = key; this.test = false; this.payload = payload; this.offline = false; this.problem = undefined;
+  }
+  private async ensureIdentity(): Promise<{ privateKey: KeyObject; publicKey: string }> {
+    if (this.identity) return this.identity;
+    const saved = await this.deviceVault.load();
+    if (saved.error) throw new Error('Не вдалося відкрити ключ пристрою. Зверніться до адміністратора ліцензій.');
+    let privateKey: KeyObject;
+    if (saved.value) {
+      try {
+        privateKey = createPrivateKey({ key: Buffer.from(saved.value, 'base64'), format: 'der', type: 'pkcs8' });
+        if (privateKey.asymmetricKeyType !== 'ed25519') throw new Error('Wrong key type');
+      }
+      catch { throw new Error('Ключ пристрою пошкоджено. Зверніться до адміністратора ліцензій.'); }
+    } else {
+      privateKey = generateKeyPairSync('ed25519').privateKey;
+      await this.deviceVault.save(privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64'));
+    }
+    const publicKey = createPublicKey(privateKey).export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+    this.identity = { privateKey, publicKey };
+    return this.identity;
   }
   private serial(action: () => Promise<void>): Promise<void> {
     const operation = this.operations.then(action); this.operations = operation.catch(() => {}); return operation;
