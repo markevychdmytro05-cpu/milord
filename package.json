@@ -16,7 +16,11 @@
     "test:license": "npm run build && node scripts/test-license-integration.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "check": "npm run typecheck && npm test && npm run build",
-    "test:parallel": "node scripts/test-parallel-cart.mjs"
+    "test:parallel": "node scripts/test-parallel-cart.mjs",
+    "build:release": "NBU_RELEASE=1 NBU_DESKTOP_ALLOW_TEST_LICENSE=${NBU_DESKTOP_ALLOW_TEST_LICENSE:-true} node scripts/build.mjs",
+    "dist": "npm run build:release && electron-builder",
+    "dist:dir": "npm run build:release && electron-builder --dir",
+    "dist:unsigned": "npm run build:release && electron-builder -c.mac.identity=-"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.3.0",
@@ -30,10 +34,76 @@
     "@types/node": "^22.20.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "bytenode": "^1.7.0",
     "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
+  },
+  "author": "Numis",
+  "build": {
+    "appId": "ua.numis.desktop",
+    "productName": "Numis",
+    "copyright": "Copyright © Numis",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "!dist/**/*.map"
+    ],
+    "asar": true,
+    "artifactName": "nbu-desktop-${version}-${os}-${arch}.${ext}",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.productivity",
+      "hardenedRuntime": true
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "category": "Utility",
+      "maintainer": "Numis"
+    }
   }
 }

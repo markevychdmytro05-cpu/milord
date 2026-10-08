@@ -4,6 +4,7 @@ import type { DesktopApi } from '../core/model';
 const api: DesktopApi = {
   activateLicense: key => ipcRenderer.invoke('activate-license', key),
   checkLicense: () => ipcRenderer.invoke('check-license'),
+  downloadUpdate: () => ipcRenderer.invoke('download-update'),
   clearLicense: () => ipcRenderer.invoke('clear-license'),
   testBehavior: input => ipcRenderer.invoke('test-behavior', input),
   stopBehaviorTest: profileId => ipcRenderer.invoke('stop-behavior-test', profileId),

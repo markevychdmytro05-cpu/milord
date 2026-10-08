@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Notification, powerSaveBlocker, safeStorage, shell } from 'electron';
+import { appendFileSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -24,10 +25,14 @@ import { AtomicClock } from './ntp';
 import { hostname } from 'node:os';
 import { deviceId } from './device-id';
 import { LicenseClient } from './license-client';
+import { downloadUpdate } from './updater';
 
 declare const __LICENSE_SERVER_URL__: string;
 declare const __LICENSE_PUBLIC_KEY__: string;
 declare const __ALLOW_TEST_LICENSE__: boolean;
+
+const clientPlatform = () => ({ win32: 'win', darwin: 'mac', linux: 'linux' } as Record<string, string>)[process.platform];
+const clientArch = () => ({ x64: 'x64', arm64: 'arm64' } as Record<string, string>)[process.arch];
 
 app.setName('NBU Desktop');
 // UI smoke tests use an isolated temporary directory, never the user's task history.
@@ -37,6 +42,13 @@ else void boot();
 
 async function boot(): Promise<void> {
   await app.whenReady();
+  // Unrecognized task failures are reported with console.error; keep them in a file for diagnosis.
+  const errorLog = join(app.getPath('userData'), 'error.log');
+  const logError = console.error.bind(console);
+  console.error = (...args: unknown[]) => {
+    logError(...args);
+    try { appendFileSync(errorLog, `${new Date().toISOString()} ${args.map(String).join(' ')}\n`); } catch { /* best effort */ }
+  };
   const store = new Store(join(app.getPath('userData'), 'tasks.json'));
   try { await store.load(); }
   catch {
@@ -70,7 +82,7 @@ async function boot(): Promise<void> {
     serverUrl: app.isPackaged ? __LICENSE_SERVER_URL__ : process.env.NBU_LICENSE_SERVER_URL || __LICENSE_SERVER_URL__,
     publicKey: app.isPackaged ? __LICENSE_PUBLIC_KEY__ : process.env.NBU_LICENSE_PUBLIC_KEY || __LICENSE_PUBLIC_KEY__,
     deviceId: await deviceId(join(app.getPath('userData'), 'license-device-id')),
-    deviceName: hostname(), appVersion: app.getVersion(), allowTestKey: !app.isPackaged && __ALLOW_TEST_LICENSE__,
+    deviceName: hostname(), appVersion: app.getVersion(), platform: clientPlatform(), arch: clientArch(), allowTestKey: __ALLOW_TEST_LICENSE__,
   }, new KeyStore(join(app.getPath('userData'), 'license.enc'), cipher),
   new KeyStore(join(app.getPath('userData'), 'license-device-key.enc'), cipher), accountsUsed);
   await license.load();
@@ -149,6 +161,13 @@ async function boot(): Promise<void> {
     });
   });
   handle('check-license', () => license.check());
+  handle('download-update', async () => {
+    const offer = license.updateOffer();
+    if (!offer) throw new Error('Оновлень немає. Натисніть «Перевірити ліцензію», щоб оновити інформацію.');
+    const file = await downloadUpdate(offer, license.state().serverUrl, app.getPath('downloads'));
+    shell.showItemInFolder(file);
+    return file;
+  });
   handle('clear-license', () => {
     licenseGeneration++;
     licenseSuspended = true;

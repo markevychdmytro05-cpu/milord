@@ -361,6 +361,21 @@ describe('verification at preparation and the sale boundary', () => {
     expect(browser.reloads).toEqual([1_000_000]);
   });
 
+  it('clicks a visible post-purchase Turnstile checkbox only once', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      turnstile: browser.clicks.length === 0 ? clock.now() < 1_002_000 : clock.now() < 1_005_000,
+      inCart: browser.clicks.length > 0 && clock.now() >= 1_005_000,
+    }));
+    const checkboxClicks: number[] = [];
+    browser.session.clickTurnstileCheckbox = async () => { checkboxClicks.push(clock.now()); return true; };
+    const input = task();
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toEqual([1_002_000]);
+    expect(checkboxClicks).toEqual([1_003_000]);
+  });
+
   it('does not assume that an earlier successful verification prevents another one', async () => {
     const clock = new FakeClock();
     const browser = fakeBrowser(clock, () => ({ ...ready,

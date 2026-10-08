@@ -116,6 +116,29 @@ async function evaluateInWorld(cdp: CDPSession, expression: string) {
 // cloud_flare_js_url). The page never contacts this host before, so its connection is always cold.
 export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com';
 
+// Click only the checkbox area of a visible, standard-size Turnstile widget. If its layout
+// differs, leave it to the person in the browser instead of guessing elsewhere on the page.
+export async function clickVisibleTurnstileCheckbox(page: Page): Promise<boolean> {
+  const point = await page.evaluate((origin) => {
+    for (const widget of document.querySelectorAll<HTMLElement>('.cf-turnstile:not(.success)')) {
+      const frame = widget.querySelector<HTMLIFrameElement>('iframe[src]');
+      if (!frame || new URL(frame.src, location.href).origin !== origin) continue;
+      widget.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+      const rect = frame.getBoundingClientRect();
+      if (rect.width < 250 || rect.width > 400 || rect.height < 50 || rect.height > 110 ||
+          rect.left < 0 || rect.top < 0 || rect.right > innerWidth || rect.bottom > innerHeight ||
+          getComputedStyle(frame).visibility !== 'visible') continue;
+      const x = rect.left + 28;
+      const y = rect.top + rect.height / 2;
+      if (document.elementFromPoint(x, y) === frame) return { x, y };
+    }
+    return null;
+  }, TURNSTILE_ORIGIN);
+  if (!point) return false;
+  await page.mouse.click(point.x, point.y);
+  return true;
+}
+
 // Connection hints: Chrome resolves DNS and opens TCP/TLS, without any request. A hint starts on
 // insertion, so each element is removed at once. Measured through a profile's proxy after 2.5 min idle:
 // the next reload sent its request after 5 ms instead of 495–731 ms.

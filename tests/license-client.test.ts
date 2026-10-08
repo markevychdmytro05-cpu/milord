@@ -200,3 +200,23 @@ describe('license server URL', () => {
     expect(() => licenseServerUrl(value)).toThrow();
   });
 });
+
+describe('update offers', () => {
+  const update = { version: '0.2.0', notes: 'Нове', size: 10, sha256: 'a'.repeat(64), url: 'http://127.0.0.1:8000/zavantazhyty/1/file?signature=x' };
+  it('sends platform and arch and exposes the signed offer without its download URL', async () => {
+    const f = fixture({ platform: 'mac', arch: 'arm64' });
+    f.reply(body => signed(body, { update }));
+    await f.client.activate(KEY);
+    const body = JSON.parse(vi.mocked(f.request).mock.calls[0]![1]!.body as string);
+    expect(body).toMatchObject({ platform: 'mac', arch: 'arm64' });
+    expect(f.client.state().update).toEqual({ version: '0.2.0', notes: 'Нове', size: 10 });
+    expect(JSON.stringify(f.client.state())).not.toContain('signature=x');
+    expect(f.client.updateOffer()).toEqual(update);
+  });
+  it('has no offer when the server sends none or rejects the license', async () => {
+    const f = fixture();
+    await f.client.activate(KEY);
+    expect(f.client.state().update).toBeUndefined();
+    expect(f.client.updateOffer()).toBeUndefined();
+  });
+});

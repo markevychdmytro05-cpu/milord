@@ -38,6 +38,9 @@ export interface ShopSession {
   warmConnection?(): Promise<void>;
   // 'mouse': a real pointer click; 'dom': the fallback DOM click.
   clickBuy(): Promise<'mouse' | 'dom' | void>;
+  // One ordinary click on a visible Turnstile checkbox after a purchase attempt.
+  // False means the widget was not ready or no safe target was found.
+  clickTurnstileCheckbox?(): Promise<boolean>;
   disconnect(): Promise<void>;
 }
 

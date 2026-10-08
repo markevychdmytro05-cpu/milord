@@ -119,6 +119,7 @@ export interface DesktopApi {
   activateLicense(key: string): Promise<void>;
   checkLicense(): Promise<void>;
   clearLicense(): Promise<void>;
+  downloadUpdate(): Promise<string>;
   testBehavior(input: { profileId: string; navigate: boolean; showCursor: boolean; minutes: number }): Promise<BehaviorTestResult>;
   stopBehaviorTest(profileId: string): Promise<void>;
   restoreCabinet(input: { connection: string; legacy?: string }): Promise<CabinetSavedState>;

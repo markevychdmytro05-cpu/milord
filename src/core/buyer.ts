@@ -63,6 +63,7 @@ export async function runTask(
   let lastDecision = '';
   let loginTried = false;
   let loginFailure = '';
+  let turnstileClickAttempted = false;
   const record = (message: string, details: EventDetails = {}) => {
     task.events.push({ at: clock.now(), message, details: {
       phase, clicks: task.clicks, reloads: task.reloads, offsetMs: task.offsetMs,
@@ -409,6 +410,19 @@ export async function runTask(
       if (notShopPage(state) && !task.clicks) decision(brokenNote(state), state.navigationHttpStatus ? { httpStatus: state.navigationHttpStatus } : {});
       else if (state.challenge || state.turnstile || state.login !== 'logged-in') {
         awaitingVerification = true;
+        if (task.clicks && state.turnstile && !state.challenge && !turnstileClickAttempted && session.clickTurnstileCheckbox) {
+          phase = 'натискання чекбокса перевірки';
+          try {
+            if (await session.clickTurnstileCheckbox()) {
+              turnstileClickAttempted = true;
+              record('Один раз натиснуто чекбокс перевірки. Очікуємо результат.');
+            }
+          } catch (error) {
+            if (signal.aborted) throw error;
+            turnstileClickAttempted = true;
+            record('Не вдалося натиснути чекбокс перевірки. Завершіть її вручну.');
+          }
+        }
         await update('needs_attention', state.login === 'logged-out'
           ? attentionNote(state, 'Потрібен вхід в акаунт НБУ.')
           : 'Потрібна перевірка сторінки у браузері. Автоматичні дії призупинені.');
@@ -515,7 +529,11 @@ export async function runTask(
       : task.clicks || observedPurchase
         ? 'Зв’язок або дія завершилися помилкою. Перевірте кошик перед новою спробою.'
         : 'Не вдалося виконати завдання. Перевірте AdsPower, профіль і сторінку магазину.';
-    if (!signal.aborted && !(error instanceof UserFacingError) && !(error instanceof ShopRateLimitError)) record(describeFailure(error));
+    if (!signal.aborted && !(error instanceof UserFacingError) && !(error instanceof ShopRateLimitError)) {
+      // The journal keeps only a classified note; the raw cause goes to the process log for diagnosis.
+      console.error(`[task ${task.id}] ${phase}:`, error instanceof Error ? `${error.name}: ${error.message}` : error);
+      record(describeFailure(error));
+    }
     record(task.note, { status: task.status,
       lastPageState: lastState ? describePage(lastState) : 'Стан сторінки ще не отримано.' });
     await persist();

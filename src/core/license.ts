@@ -10,4 +10,5 @@ export interface LicenseState {
   accountsUsed: number;
   expiresAt?: string | null;
   validUntil?: string;
+  update?: { version: string; notes: string | null; size: number };
 }

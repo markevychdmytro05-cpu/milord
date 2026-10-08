@@ -12,11 +12,14 @@ export const licenseKeySchema = z.string().trim().min(1).max(64).transform(value
 const envelopeSchema = z.object({ data: z.string().max(16_384), signature: z.string().max(128) });
 const limitsSchema = z.object({ id: z.number().int().positive(), max_accounts: z.number().int().nonnegative(),
   max_devices: z.number().int().nonnegative(), expires_at: z.iso.datetime({ offset: true }).nullable() });
+const updateSchema = z.object({ version: z.string().regex(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/), notes: z.string().max(5000).nullable(),
+  size: z.number().int().positive(), sha256: z.string().regex(/^[a-f0-9]{64}$/), url: z.string().max(2048) });
 const payloadSchema = z.object({ success: z.boolean(), error: z.string().nullable(), license: limitsSchema.nullable(),
-  valid_until: z.iso.datetime({ offset: true }).optional(), device_id: z.string(), device_public_key: z.string(), nonce: z.string().nullable(),
+  valid_until: z.iso.datetime({ offset: true }).optional(), update: updateSchema.nullish(), device_id: z.string(), device_public_key: z.string(), nonce: z.string().nullable(),
   server_time: z.iso.datetime({ offset: true }) });
 type Envelope = z.infer<typeof envelopeSchema>;
 type Payload = z.infer<typeof payloadSchema>;
+export type UpdateOffer = z.infer<typeof updateSchema>;
 export const TEST_LICENSE_KEY = 'NBU2-TEST-FRND-2626';
 const vaultSchema = z.union([
   z.object({ kind: z.literal('server'), key: licenseKeySchema, serverUrl: z.string(), envelope: envelopeSchema }),
@@ -30,7 +33,7 @@ const errors: Record<string, string> = {
   device_key_mismatch: 'Ключ цього пристрою не збігається з активацією. Зверніться до адміністратора ліцензій.',
   invalid_device_proof: 'Сервер не підтвердив ключ цього пристрою.',
 };
-export interface LicenseConfig { serverUrl: string; publicKey: string; deviceId: string; deviceName: string; appVersion: string; allowTestKey?: boolean; }
+export interface LicenseConfig { serverUrl: string; publicKey: string; deviceId: string; deviceName: string; appVersion: string; platform?: string; arch?: string; allowTestKey?: boolean; }
 
 export function licenseServerUrl(value: string): string {
   const url = new URL(value);
@@ -90,7 +93,9 @@ export class LicenseClient {
     const base = { serverUrl: this.config.serverUrl, deviceId: this.config.deviceId, accountsUsed: count,
       ...(this.key ? { keySuffix: this.key.slice(-4) } : {}),
       ...(this.payload?.license ? { maxAccounts: this.payload.license.max_accounts, maxDevices: this.payload.license.max_devices,
-        expiresAt: this.payload.license.expires_at } : {}), ...(this.payload?.valid_until ? { validUntil: this.payload.valid_until } : {}) };
+        expiresAt: this.payload.license.expires_at } : {}), ...(this.payload?.valid_until ? { validUntil: this.payload.valid_until } : {}),
+      ...(this.payload?.success && this.payload.update ? { update: { version: this.payload.update.version, notes: this.payload.update.notes,
+        size: this.payload.update.size } } : {}) };
     const result = (status: LicenseState['status'], allowed: boolean, message: string): LicenseState => ({ ...base, status, allowed, message });
     if (this.problem) return result('error', false, this.problem);
     if (this.test) return { ...result(count <= 200 ? 'test' : 'blocked', count <= 200, count <= 200
@@ -102,6 +107,10 @@ export class LicenseClient {
     if (count > this.payload.license!.max_accounts) return result('blocked', false, errors.accounts_limit_exceeded!);
     return result(this.offline ? 'offline' : 'active', true, this.offline
       ? 'Офлайн-доступ за останньою підтвердженою ліцензією.' : 'Ліцензія активна.');
+  }
+  /** Signed offer from the last successful server check; the download URL never leaves the main process. */
+  updateOffer(): UpdateOffer | undefined {
+    return this.payload?.success ? this.payload.update ?? undefined : undefined;
   }
   assertAccess(count = this.accountsUsed()): void {
     const state = this.state(count);
@@ -174,7 +183,8 @@ export class LicenseClient {
       response = await this.request(`${this.config.serverUrl}/api/v1/license/${action}`, {
         method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ key, device_id: this.config.deviceId, device_name: this.config.deviceName,
-          app_version: this.config.appVersion, nonce, request_time: requestTime, device_public_key: identity.publicKey,
+          app_version: this.config.appVersion, ...(this.config.platform ? { platform: this.config.platform } : {}),
+          ...(this.config.arch ? { arch: this.config.arch } : {}), nonce, request_time: requestTime, device_public_key: identity.publicKey,
           device_signature: deviceSignature }), signal: AbortSignal.timeout(10_000),
       });
       if (response.status === 429 || response.status >= 500) throw new LicenseUnavailable();

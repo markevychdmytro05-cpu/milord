@@ -9,7 +9,7 @@ import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../c
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
 import type { NbuLogin } from './nbu-login';
 import type { PageRecorder } from './page-recorder';
-import { assertShopPage, BUY_BUTTON, clickBuyButton, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage, warmConnection } from './nbu-page';
+import { assertShopPage, BUY_BUTTON, clickBuyButton, clickVisibleTurnstileCheckbox, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage, warmConnection } from './nbu-page';
 
 const startResponse = z.object({
   code: z.literal(0),
@@ -574,6 +574,11 @@ export class AdsPowerProvider implements BrowserProvider {
             },
             clickBuy: async () => {
               check(); this.guard.check(); assertShopPage(page, target); return clickBuyButton(cdp, page);
+            },
+            clickTurnstileCheckbox: async () => {
+              check(); assertShopPage(page, target);
+              if (!(await page.evaluate(readNbuPage, false)).turnstile) return false;
+              return clickVisibleTurnstileCheckbox(page);
             },
             // Batch owns the browser connection until its last task; only this task's channel closes.
             disconnect: async () => { await cdp.detach().catch(() => {}); },

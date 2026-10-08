@@ -10,6 +10,7 @@ import { Cabinet } from './cabinet';
 import { NbuAccountEditor, NbuAccountToggle } from './nbu-account';
 import { BehaviorTest } from './behavior-test';
 import { LicensePanel } from './license-panel';
+import { UpdateBanner } from './update-banner';
 
 declare global { interface Window { desktop: DesktopApi } }
 
@@ -561,6 +562,7 @@ function App() {
     </header>
     {state?.secretError && <div className="banner" role="alert">{state.secretError}</div>}
     {state?.accountsError && <div className="banner" role="alert">{state.accountsError}</div>}
+    {state?.license.update && <UpdateBanner update={state.license.update} />}
     {state && !state.license.allowed && tab !== 'settings' && <div className="banner" role="alert">
       {state.license.message} <button type="button" className="link" onClick={() => setTab('settings')}>Відкрити налаштування ліцензії</button>
     </div>}
