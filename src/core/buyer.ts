@@ -413,10 +413,10 @@ export async function runTask(
         if (task.clicks && state.turnstile && !state.challenge && !turnstileClickAttempted && session.clickTurnstileCheckbox) {
           phase = 'натискання чекбокса перевірки';
           try {
-            if (await session.clickTurnstileCheckbox()) {
-              turnstileClickAttempted = true;
-              record('Один раз натиснуто чекбокс перевірки. Очікуємо результат.');
-            }
+            const clicked = await session.clickTurnstileCheckbox();
+            turnstileClickAttempted = true;
+            record(clicked ? 'Один раз натиснуто чекбокс перевірки. Очікуємо результат.'
+              : 'Видимий чекбокс не знайдено. Завершіть перевірку вручну.');
           } catch (error) {
             if (signal.aborted) throw error;
             turnstileClickAttempted = true;
