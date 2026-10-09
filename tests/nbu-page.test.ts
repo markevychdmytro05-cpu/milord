@@ -1,6 +1,6 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readNbuPage, assertShopPage, waitForActionablePage, waitForPurchaseChangePage, clickBuyButton, clickVisibleTurnstileCheckbox } from '../src/browser/nbu-page';
+import { readNbuPage, assertShopPage, waitForActionablePage, waitForPurchaseChangePage, clickBuyButton, clickVisibleTurnstileCheckbox, isFrameUnobstructed } from '../src/browser/nbu-page';
 import type { CDPSession, Page } from 'patchright-core';
 
 let dom: JSDOM | undefined;
@@ -119,17 +119,45 @@ it('detects a visible second widget even when the first placeholder is hidden', 
   expect(clicked).not.toHaveBeenCalled();
 });
 
+it('recognizes an unobstructed Turnstile iframe inside shadow DOM', () => {
+  const document = page('<div id="widget-host"></div>');
+  vi.stubGlobal('ShadowRoot', dom!.window.ShadowRoot);
+  const host = document.querySelector('#widget-host')!;
+  const root = host.attachShadow({ mode: 'open' });
+  const frame = document.createElement('iframe');
+  root.append(frame);
+  const overlay = document.createElement('div');
+  const hit = (scope: Document | ShadowRoot, element: Element) =>
+    Object.defineProperty(scope, 'elementFromPoint', { configurable: true, value: () => element });
+  hit(document, host);
+  hit(root, frame);
+  expect(isFrameUnobstructed(frame, { x: 20, y: 20 })).toBe(true);
+  hit(document, overlay);
+  expect(isFrameUnobstructed(frame, { x: 20, y: 20 })).toBe(false);
+  hit(document, host);
+  hit(root, overlay);
+  expect(isFrameUnobstructed(frame, { x: 20, y: 20 })).toBe(false);
+  const plainFrame = document.createElement('iframe');
+  document.body.append(plainFrame);
+  hit(document, plainFrame);
+  expect(isFrameUnobstructed(plainFrame, { x: 20, y: 20 })).toBe(true);
+});
+
 it('aims inside the Turnstile checkbox at a scaled widget size', async () => {
   const click = vi.fn();
   const move = vi.fn();
-  const checkbox = { count: async () => 1, isVisible: async () => true, isChecked: async () => false,
+  const waitFor = vi.fn();
+  const checkbox = { count: async () => 1, waitFor, isVisible: async () => true, isChecked: async () => false,
     boundingBox: async () => ({ x: 109, y: 220.5, width: 168, height: 24 }) };
   const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
     boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }),
+    evaluate: async () => true,
     contentFrame: () => ({ getByRole: () => checkbox }) };
-  const browserPage = { evaluate: async () => ({ width: 1470, height: 797 }),
+  const browserPage = { evaluate: async (fn: unknown) => fn === readNbuPage
+    ? { turnstile: true, inCart: false, challenge: false } : { width: 1470, height: 797 },
     locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move, click } } as unknown as Page;
   expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
+  expect(waitFor).not.toHaveBeenCalled();
   expect(move).toHaveBeenCalledWith(121, 232.5);
   expect(click).toHaveBeenCalledWith(121, 232.5, { delay: 120 });
 });
@@ -137,17 +165,72 @@ it('aims inside the Turnstile checkbox at a scaled widget size', async () => {
 it('waits briefly for the checkbox after its iframe becomes visible', async () => {
   const click = vi.fn();
   let ready = false;
-  const waitFor = vi.fn(async () => { ready = true; });
+  const waitFor = vi.fn(async (_options: { state: string; timeout: number }) => { ready = true; });
   const checkbox = { count: async () => ready ? 1 : 0, waitFor, isVisible: async () => ready,
     isChecked: async () => false, boundingBox: async () => ({ x: 109, y: 220, width: 168, height: 24 }) };
   const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
     boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }),
+    evaluate: async () => true,
     contentFrame: () => ({ getByRole: () => checkbox }) };
-  const browserPage = { evaluate: async () => ({ width: 1470, height: 797 }),
+  const browserPage = { evaluate: async (fn: unknown) => fn === readNbuPage
+    ? { turnstile: true, inCart: false, challenge: false } : { width: 1470, height: 797 },
     locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move: vi.fn(), click } } as unknown as Page;
   expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
-  expect(waitFor).toHaveBeenCalledWith({ state: 'visible', timeout: 700 });
+  expect(waitFor).toHaveBeenCalledWith({ state: 'visible', timeout: expect.any(Number) });
+  expect(waitFor.mock.calls[0]![0].timeout).toBeGreaterThan(700);
   expect(click).toHaveBeenCalledWith(121, 232, { delay: 120 });
+});
+
+it('waits for a visible iframe instead of giving up on a hidden placeholder', async () => {
+  const click = vi.fn();
+  let visible = false;
+  const checkbox = { waitFor: async () => {}, count: async () => 1, isVisible: async () => true,
+    isChecked: async () => false, boundingBox: async () => ({ x: 109, y: 220, width: 168, height: 24 }) };
+  const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
+    boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }), evaluate: async () => true,
+    contentFrame: () => ({ getByRole: () => checkbox }) };
+  const waitFor = vi.fn(async () => { visible = true; });
+  const browserPage = { evaluate: async (fn: unknown) => fn === readNbuPage
+    ? { turnstile: true, inCart: false, challenge: false } : { width: 1470, height: 797 },
+    locator: (selector: string) => {
+      expect(selector).toContain(':visible');
+      return { count: async () => visible ? 1 : 0, first: () => ({ waitFor }), nth: () => frame };
+    }, mouse: { move: vi.fn(), click } } as unknown as Page;
+  expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
+  expect(waitFor).toHaveBeenCalledOnce();
+  expect(click).toHaveBeenCalledOnce();
+});
+
+it('does not click when verification resolves or an overlay covers the iframe during the wait', async () => {
+  for (const blocked of ['resolved', 'covered']) {
+    const click = vi.fn();
+    const checkbox = { waitFor: async () => {}, count: async () => 1, isVisible: async () => true,
+      isChecked: async () => false, boundingBox: async () => ({ x: 109, y: 220, width: 168, height: 24 }) };
+    const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
+      boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }),
+      evaluate: async () => blocked !== 'covered', contentFrame: () => ({ getByRole: () => checkbox }) };
+    const browserPage = { evaluate: async (fn: unknown) => fn === readNbuPage
+      ? { turnstile: blocked !== 'resolved', inCart: false, challenge: false } : { width: 1470, height: 797 },
+      locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move: vi.fn(), click } } as unknown as Page;
+    expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(false);
+    expect(click).not.toHaveBeenCalled();
+  }
+});
+
+it('does not click after the task is cancelled while waiting for the iframe', async () => {
+  const controller = new AbortController();
+  const click = vi.fn();
+  const checkbox = { count: async () => 0,
+    waitFor: async () => { controller.abort(); }, isVisible: async () => true,
+    isChecked: async () => false, boundingBox: async () => ({ x: 109, y: 220, width: 168, height: 24 }) };
+  const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
+    boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }), evaluate: async () => true,
+    contentFrame: () => ({ getByRole: () => checkbox }) };
+  const browserPage = { evaluate: async (fn: unknown) => fn === readNbuPage
+    ? { turnstile: true, inCart: false, challenge: false } : { width: 1470, height: 797 },
+    locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move: vi.fn(), click } } as unknown as Page;
+  await expect(clickVisibleTurnstileCheckbox(browserPage, controller.signal)).rejects.toThrow();
+  expect(click).not.toHaveBeenCalled();
 });
 
 it('stops treating a widget as completed when the site removes its success state', () => {

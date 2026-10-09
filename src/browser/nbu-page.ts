@@ -116,31 +116,51 @@ async function evaluateInWorld(cdp: CDPSession, expression: string) {
 // cloud_flare_js_url). The page never contacts this host before, so its connection is always cold.
 export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com';
 
+// Runs in the page: Turnstile's iframe may sit inside one or more shadow roots.
+export function isFrameUnobstructed(element: Element, point: { x: number; y: number }): boolean {
+  let target = element;
+  for (;;) {
+    const root = target.getRootNode();
+    if (root instanceof ShadowRoot) {
+      if (root.elementFromPoint(point.x, point.y) !== target) return false;
+      target = root.host;
+    } else return document.elementFromPoint(point.x, point.y) === target;
+  }
+}
+
 // Click the actual checkbox inside a visible, standard-size Turnstile widget. The iframe can
 // scale with browser zoom, so a fixed offset from its edge can miss the checkbox itself.
-export async function clickVisibleTurnstileCheckbox(page: Page): Promise<boolean> {
-  const frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]');
-  const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+export async function clickVisibleTurnstileCheckbox(page: Page, signal?: AbortSignal): Promise<boolean> {
+  // Locator waits follow the iframe and its cross-origin checkbox as they appear. One bounded
+  // wait avoids returning to the buyer's outer loop while the widget is still loading.
+  const frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]:visible');
+  const until = Date.now() + 1800;
   if (!await frames.count()) {
-    try { await frames.first().waitFor({ state: 'visible', timeout: 700 }); }
-    catch { return false; }
+    try { await frames.first().waitFor({ state: 'visible', timeout: Math.max(1, until - Date.now()) }); }
+    catch { signal?.throwIfAborted(); return false; }
   }
   for (let index = 0, count = await frames.count(); index < count; index++) {
+    signal?.throwIfAborted();
     const frame = frames.nth(index);
     try {
       if (!await frame.isVisible()) continue;
-      await frame.scrollIntoViewIfNeeded({ timeout: 1000 });
-    } catch { continue; } // The widget can replace its iframe while loading.
+      await frame.scrollIntoViewIfNeeded({ timeout: Math.max(1, Math.min(1000, until - Date.now())) });
+    } catch { signal?.throwIfAborted(); continue; } // The widget can replace its iframe while loading.
     const checkbox = frame.contentFrame().getByRole('checkbox');
     let rect;
     let box;
+    let viewport;
     try {
-      if (await checkbox.count() !== 1) await checkbox.waitFor({ state: 'visible', timeout: 700 });
-      if (!await checkbox.isVisible() || await checkbox.isChecked({ timeout: 1000 })) continue;
+      if (await checkbox.count() !== 1 || !await checkbox.isVisible()) {
+        await checkbox.waitFor({ state: 'visible', timeout: Math.max(1, until - Date.now()) });
+      }
+      signal?.throwIfAborted();
+      if (await checkbox.count() !== 1 || !await checkbox.isVisible() || await checkbox.isChecked({ timeout: 1000 })) continue;
       [rect, box] = await Promise.all([
         frame.boundingBox({ timeout: 1000 }), checkbox.boundingBox({ timeout: 1000 }),
       ]);
-    } catch { continue; } // Retry later if Turnstile refreshed between reads.
+      viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    } catch { signal?.throwIfAborted(); continue; } // Retry later if Turnstile refreshed between reads.
     if (!rect || rect.width < 250 || rect.width > 400 || rect.height < 50 || rect.height > 110 ||
         rect.x < 0 || rect.y < 0 || rect.x + rect.width > viewport.width ||
         rect.y + rect.height > viewport.height) continue;
@@ -150,7 +170,18 @@ export async function clickVisibleTurnstileCheckbox(page: Page): Promise<boolean
     // The input also covers its label. Aim at the centre of its square on the left.
     const x = box.x + Math.min(12, box.height / 2);
     const y = box.y + box.height / 2;
+    // A completed challenge or an overlay can move during the wait. Never click through it.
+    try {
+      const [state, unobstructed] = await Promise.all([
+        page.evaluate(readNbuPage, false),
+        frame.evaluate(isFrameUnobstructed, { x, y }),
+      ]);
+      if (!state.turnstile || state.inCart || state.challenge || !unobstructed ||
+          x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) continue;
+    } catch { signal?.throwIfAborted(); continue; }
+    signal?.throwIfAborted();
     await page.mouse.move(x, y);
+    signal?.throwIfAborted();
     await page.mouse.click(x, y, { delay: 120 });
     return true;
   }

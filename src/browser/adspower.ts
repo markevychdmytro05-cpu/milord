@@ -621,7 +621,7 @@ export class AdsPowerProvider implements BrowserProvider {
             clickTurnstileCheckbox: async () => {
               check(); assertShopPage(page, target);
               if (!(await page.evaluate(readNbuPage, false)).turnstile) return false;
-              return clickVisibleTurnstileCheckbox(page);
+              return clickVisibleTurnstileCheckbox(page, taskSignal);
             },
             // Batch owns the browser connection until its last task; only this task's channel closes.
             disconnect: async () => { await cdp.detach().catch(() => {}); },

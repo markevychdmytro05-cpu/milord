@@ -417,13 +417,15 @@ export async function runTask(
         if (task.clicks && state.turnstile && !state.challenge && !turnstileClickAttempted && session.clickTurnstileCheckbox) {
           phase = 'натискання чекбокса перевірки';
           try {
+            const checkboxStartedAt = clock.now();
             const clicked = await session.clickTurnstileCheckbox();
+            const checkboxWaitMs = clock.now() - checkboxStartedAt;
             if (clicked) {
               turnstileClickAttempted = true;
-              record('Один раз натиснуто чекбокс перевірки. Очікуємо результат.');
+              record('Один раз натиснуто чекбокс перевірки. Очікуємо результат.', { checkboxWaitMs });
             } else if (!turnstileWidgetPendingNoted) {
               turnstileWidgetPendingNoted = true;
-              record('Чекбокс перевірки ще не завантажився або недоступний. Очікуємо його появи.');
+              record('Чекбокс перевірки ще не завантажився або недоступний. Очікуємо його появи.', { checkboxWaitMs });
             }
             checkboxStillLoading = !clicked;
           } catch (error) {
