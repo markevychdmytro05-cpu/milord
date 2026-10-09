@@ -121,23 +121,29 @@ export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com';
 export async function clickVisibleTurnstileCheckbox(page: Page): Promise<boolean> {
   const frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]');
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+  if (!await frames.count()) {
+    try { await frames.first().waitFor({ state: 'visible', timeout: 700 }); }
+    catch { return false; }
+  }
   for (let index = 0, count = await frames.count(); index < count; index++) {
     const frame = frames.nth(index);
-    if (!await frame.isVisible()) continue;
-    let rect;
     try {
+      if (!await frame.isVisible()) continue;
       await frame.scrollIntoViewIfNeeded({ timeout: 1000 });
-      rect = await frame.boundingBox({ timeout: 1000 });
     } catch { continue; } // The widget can replace its iframe while loading.
+    const checkbox = frame.contentFrame().getByRole('checkbox');
+    let rect;
+    let box;
+    try {
+      if (await checkbox.count() !== 1) await checkbox.waitFor({ state: 'visible', timeout: 700 });
+      if (!await checkbox.isVisible() || await checkbox.isChecked({ timeout: 1000 })) continue;
+      [rect, box] = await Promise.all([
+        frame.boundingBox({ timeout: 1000 }), checkbox.boundingBox({ timeout: 1000 }),
+      ]);
+    } catch { continue; } // Retry later if Turnstile refreshed between reads.
     if (!rect || rect.width < 250 || rect.width > 400 || rect.height < 50 || rect.height > 110 ||
         rect.x < 0 || rect.y < 0 || rect.x + rect.width > viewport.width ||
         rect.y + rect.height > viewport.height) continue;
-    const checkbox = frame.contentFrame().getByRole('checkbox');
-    let box;
-    try {
-      if (await checkbox.count() !== 1 || !await checkbox.isVisible() || await checkbox.isChecked({ timeout: 1000 })) continue;
-      box = await checkbox.boundingBox({ timeout: 1000 });
-    } catch { continue; } // Retry later if Turnstile refreshed between reads.
     if (!box || box.width < 18 || box.height < 18 || box.height > 40 ||
         box.x < rect.x || box.y < rect.y || box.x + box.width > rect.x + rect.width ||
         box.y + box.height > rect.y + rect.height) continue;
@@ -230,6 +236,35 @@ export async function waitForActionablePage(page: Page, timeoutMs: number): Prom
   })`;
   // DOM mutations wake immediately; animation frames cover CSS-only visibility changes.
   // A bounded timeout releases the observer for cancellation and scheduled network refreshes.
+  return page.evaluate<PageState>(expression);
+}
+
+export async function waitForPurchaseChangePage(page: Page, timeoutMs: number): Promise<PageState> {
+  // The buy handler changes this page when Turnstile, the queue or the cart is ready. Observe
+  // those changes locally; an already pending button must not release the waiter immediately.
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.min(1000, timeoutMs)) : 1000;
+  const expression = `new Promise((resolve) => {
+    const read = ${readNbuPage.toString()};
+    let finished = false;
+    let timer;
+    const observer = new MutationObserver(check);
+    function finish(state) {
+      if (finished) return;
+      finished = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      resolve(state);
+    }
+    function check() {
+      if (finished) return;
+      const state = read();
+      if (state.rateLimited || state.inCart || state.challenge || state.turnstile || state.queuePosition ||
+          state.login !== 'logged-in') finish(state);
+    }
+    observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    timer = setTimeout(() => finish(read()), ${timeout});
+    check();
+  })`;
   return page.evaluate<PageState>(expression);
 }
 

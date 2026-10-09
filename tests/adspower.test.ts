@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AdsPowerClient, compensateForLatency, reloadTiming, responseClockOffset, validateCdpEndpoint } from '../src/browser/adspower';
+import { AdsPowerClient, ProfileStartGate, compensateForLatency, reloadTiming, responseClockOffset, validateCdpEndpoint } from '../src/browser/adspower';
 import { productUrl, taskInputSchema } from '../src/core/model';
 import { task } from './helpers';
 
@@ -69,6 +69,53 @@ describe('AdsPower Local API adapter', () => {
     expect(failure.message).toContain(expected);
     expect(failure.message).not.toContain(body.msg);
     expect(failure.name).toBe('UserFacingError');
+  });
+
+  it.each([
+    { code: -1, msg: 'user_id is not exist' },
+    { code: 1001, msg: 'Authentication failed, possible reasons: invalid login status or incorrect API key.' },
+  ])('starts the selected local profile without a stale key: %j', async (failure) => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify(failure)))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 0,
+        data: { ws: { puppeteer: 'ws://127.0.0.1:54321/devtools/browser/test' } } })));
+    const client = new AdsPowerClient('http://127.0.0.1:50325', 'stale-key', request);
+    expect(await client.start('abc123', new AbortController().signal)).toContain('54321');
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[0]![1]?.headers).toEqual({ Authorization: 'Bearer stale-key' });
+    expect(request.mock.calls[1]![1]?.headers).toEqual({});
+    expect(String(request.mock.calls[1]![0])).toContain('user_id=abc123');
+  });
+
+  it('keeps the original authentication error when local no-key access is unavailable', async () => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 1001,
+        msg: 'Authentication failed for user_id: incorrect API key.' })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: 1001, msg: 'Authentication failed' })));
+    const failure = await failureOf(new AdsPowerClient('http://127.0.0.1:50325', 'stale-key', request)
+      .start('abc123', new AbortController().signal));
+    expect(failure.message).toContain('API-ключ');
+  });
+
+  it('retries a transient missing-profile response and records safe failure details', async () => {
+    const missing = { code: -1, msg: 'The user does not exist' };
+    const success = { code: 0, data: { ws: { puppeteer: 'ws://127.0.0.1:54321/devtools/browser/test' } } };
+    const gate = new ProfileStartGate();
+    vi.spyOn(gate, 'wait').mockResolvedValue();
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify(missing)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(missing)))
+      .mockResolvedValueOnce(new Response(JSON.stringify(success)));
+    const client = new AdsPowerClient('http://127.0.0.1:50325', 'saved-key', request, gate);
+    expect(await client.start('abc123', new AbortController().signal)).toContain('54321');
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(request.mock.calls.slice(1).every((call) => JSON.stringify(call[1]?.headers) === '{}')).toBe(true);
+
+    const alwaysMissing = vi.fn<typeof fetch>().mockImplementation(async () => new Response(JSON.stringify(missing)));
+    const failure = await failureOf(new AdsPowerClient('http://127.0.0.1:50325', '', alwaysMissing, gate)
+      .start('abc123', new AbortController().signal, Date.now() + 3000));
+    expect(failure.message).toContain('код AdsPower: -1; спроб: 3');
+    expect(alwaysMissing).toHaveBeenCalledTimes(3);
   });
 
   it('says AdsPower is unreachable, wrong-key or failing, using fixed text', async () => {

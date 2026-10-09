@@ -376,6 +376,26 @@ describe('verification at preparation and the sale boundary', () => {
     expect(checkboxClicks).toEqual([1_003_000]);
   });
 
+  it('reacts to Turnstile without the fixed post-purchase second when the page changes sooner', async () => {
+    const clock = new FakeClock();
+    const browser = fakeBrowser(clock, () => ({ ...ready,
+      buyAvailable: browser.clicks.length === 0,
+      purchasePending: browser.clicks.length > 0 && clock.now() < 1_001_075,
+      turnstile: browser.clicks.length > 0 && clock.now() >= 1_000_075 && clock.now() < 1_000_500,
+      inCart: browser.clicks.length > 0 && clock.now() >= 1_001_075,
+    }));
+    const waits: number[] = [];
+    browser.session.waitForPurchaseChange = async () => { waits.push(clock.now()); clock.time += 75; };
+    const checkboxClicks: number[] = [];
+    browser.session.clickTurnstileCheckbox = async () => { checkboxClicks.push(clock.now()); return true; };
+    const input = task();
+    await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
+    expect(input.status).toBe('in_cart');
+    expect(browser.clicks).toEqual([1_000_000]);
+    expect(waits).toEqual([1_000_000]);
+    expect(checkboxClicks).toEqual([1_000_075]);
+  });
+
   it('waits for the Turnstile iframe to load before using its one checkbox click', async () => {
     const clock = new FakeClock();
     const browser = fakeBrowser(clock, () => ({ ...ready,
@@ -391,7 +411,7 @@ describe('verification at preparation and the sale boundary', () => {
     await runTask(input, browser.provider, clock, new AbortController().signal, async () => {});
     expect(input.status).toBe('in_cart');
     expect(browser.clicks).toEqual([1_002_000]);
-    expect(checkboxChecks).toEqual([1_003_000, 1_004_000]);
+    expect(checkboxChecks).toEqual([1_003_000, 1_003_200]);
     expect(input.events.filter((event) => event.message.includes('Один раз натиснуто чекбокс'))).toHaveLength(1);
   });
 

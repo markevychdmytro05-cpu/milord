@@ -20,6 +20,9 @@ export interface ShopSession {
   read(): Promise<PageState>;
   recoverRateLimit?(deadline: number): Promise<boolean>;
   waitForActionable(timeoutMs: number): Promise<PageState>;
+  // After a purchase click, wake when the shop shows verification, a queue, or cart confirmation.
+  // This only observes the current page and times out; it sends no shop request.
+  waitForPurchaseChange?(timeoutMs: number): Promise<void>;
   // Network timing of the reloaded document, when the browser reports it. For the journal only.
   reload(): Promise<ReloadTiming | void>;
   serverOffset(): Promise<number>;

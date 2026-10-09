@@ -9,7 +9,7 @@ import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../c
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
 import type { NbuLogin } from './nbu-login';
 import type { PageRecorder } from './page-recorder';
-import { assertShopPage, BUY_BUTTON, clickBuyButton, clickVisibleTurnstileCheckbox, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage, warmConnection } from './nbu-page';
+import { assertShopPage, BUY_BUTTON, clickBuyButton, clickVisibleTurnstileCheckbox, prepareClickWorld, readNbuPage, readVisibleCartProductIds, waitForActionablePage, waitForPurchaseChangePage, warmConnection } from './nbu-page';
 
 const startResponse = z.object({
   code: z.literal(0),
@@ -45,16 +45,24 @@ export class ProfileStartGate {
 // Translate AdsPower's own error text into fixed messages. The raw text is never shown or saved.
 export function adsPowerFailure(code: number | undefined, message: string | undefined): UserFacingError {
   const text = (message || '').toLowerCase();
-  if (/not.?exist|not.?found|no such|invalid.?user|user.?id/.test(text)) {
-    return new UserFacingError('AdsPower не знайшов цей профіль. Перевірте ID профілю.');
-  }
   if (/too many|frequen|rate/.test(text)) {
     return new UserFacingError('AdsPower обмежив частоту запитів. Спробуйте за кілька секунд.');
   }
   if (/api.?key|auth|token|permission|unauthori|forbidden/.test(text)) {
     return new UserFacingError('AdsPower відхилив запит. Перевірте API-ключ у налаштуваннях.');
   }
+  if (/not.?exist|not.?found|no such|invalid.?user|user.?id/.test(text)) {
+    return new UserFacingError('AdsPower не знайшов цей профіль. Перевірте ID профілю.');
+  }
   return new UserFacingError(`AdsPower не зміг запустити профіль${Number.isInteger(code) ? ` (код ${code})` : ''}.`);
+}
+
+function canRetryLocalProfileWithoutKey(code: number | undefined, message: string | undefined): boolean {
+  return code === 1001 || /not.?exist|not.?found|no such|invalid.?user|user.?id|api.?key|auth|token|permission|unauthori|forbidden/i.test(message || '');
+}
+
+function profileNotFound(message: string | undefined): boolean {
+  return /not.?exist|not.?found|no such|invalid.?user|user.?id/i.test(message || '');
 }
 
 export class AdsPowerConnectionError extends UserFacingError {}
@@ -135,7 +143,7 @@ export class AdsPowerClient {
     }
   }
 
-  async start(profileId: string, signal: AbortSignal): Promise<string> {
+  async start(profileId: string, signal: AbortSignal, deadline = Date.now() + 10_000): Promise<string> {
     if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profileId)) throw new Error('Invalid profile ID');
     await this.startGate.wait(signal);
     const url = new URL('/api/v1/browser/start', this.base);
@@ -144,8 +152,8 @@ export class AdsPowerClient {
     // Do not restore unrelated historical tabs or open the IP test page.
     url.searchParams.set('open_tabs', '1');
     url.searchParams.set('ip_tab', '0');
-    const send = () => this.request(url, {
-      headers: this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {},
+    const send = (apiKey = this.apiKey) => this.request(url, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
       signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
       redirect: 'error',
     });
@@ -170,10 +178,40 @@ export class AdsPowerClient {
     let body: unknown;
     try { body = await response.json(); }
     catch { throw new UserFacingError('AdsPower відповів у незрозумілому форматі. Оновіть AdsPower.'); }
-    const result = startResponse.safeParse(body);
+    let result = startResponse.safeParse(body);
     if (!result.success) {
       const failure = z.object({ code: z.number().optional(), msg: z.string().optional() }).safeParse(body);
-      throw adsPowerFailure(failure.data?.code, failure.data?.msg);
+      let lastFailure = failure.data;
+      let attempts = 1;
+      // A stale key can refer to a different AdsPower login. The Local API on loopback may still
+      // open this exact saved profile without a key. AdsPower can also briefly report a missing
+      // profile while its account data is loading. Space retries and stop before the task deadline.
+      if (canRetryLocalProfileWithoutKey(failure.data?.code, failure.data?.msg)) {
+        const retryUntil = Math.min(deadline, Date.now() + 40_000);
+        for (const delayMs of [0, 2000, 4000, 6000, 8000, 8000, 8000]) {
+          if (Date.now() + delayMs >= retryUntil) break;
+          if (delayMs) await realClock.sleep(delayMs, signal);
+          await this.startGate.wait(signal);
+          try {
+            const local = await send('');
+            attempts++;
+            if (!local.ok) break;
+            const retryBody = await local.json();
+            result = startResponse.safeParse(retryBody);
+            if (result.success) break;
+            lastFailure = z.object({ code: z.number().optional(), msg: z.string().optional() }).safeParse(retryBody).data;
+            if (!profileNotFound(lastFailure?.msg)) break;
+          } catch (error) {
+            if (signal.aborted) throw error;
+            break;
+          }
+        }
+      }
+      if (!result.success) {
+        const reason = adsPowerFailure(lastFailure?.code, lastFailure?.msg);
+        // Keep raw AdsPower text out of task history; the numeric code and attempt count aid diagnosis.
+        throw new UserFacingError(`${reason.message} (код AdsPower: ${lastFailure?.code ?? 'невідомий'}; спроб: ${attempts}).`);
+      }
     }
     try { return validateCdpEndpoint(result.data.data.ws.puppeteer); }
     catch { throw new UserFacingError('AdsPower повернув некоректну адресу браузера профілю.'); }
@@ -247,7 +285,7 @@ export class AdsPowerProvider implements BrowserProvider {
     const targets = [...new Set(urls.map(productUrl))];
     if (!targets.length) throw new Error('No product pages to prepare');
     signal.throwIfAborted();
-    const endpoint = await this.client.start(profileId, signal);
+    const endpoint = await this.client.start(profileId, signal, options?.deadline);
     signal.throwIfAborted();
     let browser: Browser | undefined;
     const listeners: Array<{ page: Page; handler: (response: Response) => void }> = [];
@@ -492,6 +530,11 @@ export class AdsPowerProvider implements BrowserProvider {
               check(); onTarget();
               return { ...state, navigationHttpStatus: navigationStatuses.get(page), sharedRateLimit: this.guard.isBlocked(),
                 rateLimited: state.rateLimited || this.guard.isBlocked() };
+            },
+            waitForPurchaseChange: async (timeoutMs) => {
+              check(); onTarget();
+              await settled(() => waitForPurchaseChangePage(page, timeoutMs));
+              check(); onTarget();
             },
             // Reuse the Date header of the ordinary document response, latency-compensated. No HEAD probes.
             serverOffset: async () => { check(); return offsets.get(page) ?? 0; },

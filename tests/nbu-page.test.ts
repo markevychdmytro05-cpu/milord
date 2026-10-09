@@ -1,6 +1,6 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readNbuPage, assertShopPage, waitForActionablePage, clickBuyButton, clickVisibleTurnstileCheckbox } from '../src/browser/nbu-page';
+import { readNbuPage, assertShopPage, waitForActionablePage, waitForPurchaseChangePage, clickBuyButton, clickVisibleTurnstileCheckbox } from '../src/browser/nbu-page';
 import type { CDPSession, Page } from 'patchright-core';
 
 let dom: JSDOM | undefined;
@@ -78,6 +78,22 @@ describe('NBU page recognition from the ported selectors', () => {
     const browserPage = { evaluate: (expression: string) => dom!.window.eval(expression) } as unknown as Page;
     expect((await waitForActionablePage(browserPage, 5)).buyAvailable).toBe(false);
   });
+  it('wakes on a post-purchase Turnstile mutation before the timeout', async () => {
+    const document = page();
+    document.querySelector('button')!.classList.add('clicked');
+    const browserPage = { evaluate: (expression: string) => dom!.window.eval(expression) } as unknown as Page;
+    const result = waitForPurchaseChangePage(browserPage, 1000);
+    const widget = document.createElement('div');
+    widget.className = 'cf-turnstile';
+    vi.spyOn(widget, 'getBoundingClientRect').mockReturnValue({ width: 300, height: 65 } as DOMRect);
+    document.querySelector('#r_buy_intovar')!.append(widget);
+    expect((await Promise.race([result, new Promise<null>((resolve) => setTimeout(() => resolve(null), 100))]))?.turnstile).toBe(true);
+  });
+  it('times out while a post-purchase button stays pending', async () => {
+    page().querySelector('button')!.classList.add('clicked');
+    const browserPage = { evaluate: (expression: string) => dom!.window.eval(expression) } as unknown as Page;
+    expect(await waitForPurchaseChangePage(browserPage, 5)).toMatchObject({ purchasePending: true, turnstile: false });
+  });
   it.each(['<a href="shopping_cart.php">Кошик</a>', '<span id="cart-queue-position">12</span>',
     '<a class="login">Увійти</a>'])('refuses a click when page state changed: %s', (markup) => {
     const document = page(markup);
@@ -116,6 +132,22 @@ it('aims inside the Turnstile checkbox at a scaled widget size', async () => {
   expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
   expect(move).toHaveBeenCalledWith(121, 232.5);
   expect(click).toHaveBeenCalledWith(121, 232.5, { delay: 120 });
+});
+
+it('waits briefly for the checkbox after its iframe becomes visible', async () => {
+  const click = vi.fn();
+  let ready = false;
+  const waitFor = vi.fn(async () => { ready = true; });
+  const checkbox = { count: async () => ready ? 1 : 0, waitFor, isVisible: async () => ready,
+    isChecked: async () => false, boundingBox: async () => ({ x: 109, y: 220, width: 168, height: 24 }) };
+  const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
+    boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }),
+    contentFrame: () => ({ getByRole: () => checkbox }) };
+  const browserPage = { evaluate: async () => ({ width: 1470, height: 797 }),
+    locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move: vi.fn(), click } } as unknown as Page;
+  expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
+  expect(waitFor).toHaveBeenCalledWith({ state: 'visible', timeout: 700 });
+  expect(click).toHaveBeenCalledWith(121, 232, { delay: 120 });
 });
 
 it('stops treating a widget as completed when the site removes its success state', () => {

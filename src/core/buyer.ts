@@ -134,6 +134,8 @@ export async function runTask(
     await persist();
   };
   const wait = (ms = 1000) => clock.sleep(ms, signal);
+  const waitForPurchaseChange = () => session?.waitForPurchaseChange
+    ? session.waitForPurchaseChange(1000) : wait();
 
   try {
     check();
@@ -411,6 +413,7 @@ export async function runTask(
       if (notShopPage(state) && !task.clicks) decision(brokenNote(state), state.navigationHttpStatus ? { httpStatus: state.navigationHttpStatus } : {});
       else if (state.challenge || state.turnstile || state.login !== 'logged-in') {
         awaitingVerification = true;
+        let checkboxStillLoading = false;
         if (task.clicks && state.turnstile && !state.challenge && !turnstileClickAttempted && session.clickTurnstileCheckbox) {
           phase = 'натискання чекбокса перевірки';
           try {
@@ -422,6 +425,7 @@ export async function runTask(
               turnstileWidgetPendingNoted = true;
               record('Чекбокс перевірки ще не завантажився або недоступний. Очікуємо його появи.');
             }
+            checkboxStillLoading = !clicked;
           } catch (error) {
             if (signal.aborted) throw error;
             turnstileClickAttempted = true;
@@ -431,7 +435,8 @@ export async function runTask(
         await update('needs_attention', state.login === 'logged-out'
           ? attentionNote(state, 'Потрібен вхід в акаунт НБУ.')
           : 'Потрібна перевірка сторінки у браузері. Автоматичні дії призупинені.');
-        await wait();
+        // The iframe waiter already spent up to 700 ms looking for the checkbox.
+        await wait(checkboxStillLoading ? 200 : 1000);
         continue;
       }
       if (state.queuePosition) {
@@ -444,7 +449,7 @@ export async function runTask(
       if (state.purchasePending) {
         awaitingVerification = false;
         await update('firing', 'Магазин обробляє додавання в кошик. Очікуємо підтвердження.');
-        await wait();
+        await waitForPurchaseChange();
         continue;
       }
       if (observedQueue) {
@@ -518,8 +523,8 @@ export async function runTask(
       }
       await persist();
       if (task.clicks) capture('after-click');
-      // Before the first click, the browser waiter drives the loop; never add a 1 s sleep after reload.
-      if (task.clicks) await wait();
+      // After a click, wake on the shop's next visible result without requesting the shop again.
+      if (task.clicks) await waitForPurchaseChange();
     }
   } catch (error) {
     task.status = signal.aborted ? 'cancelled' : task.clicks || observedPurchase ? 'interrupted'
