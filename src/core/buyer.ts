@@ -64,6 +64,7 @@ export async function runTask(
   let loginTried = false;
   let loginFailure = '';
   let turnstileClickAttempted = false;
+  let turnstileWidgetPendingNoted = false;
   const record = (message: string, details: EventDetails = {}) => {
     task.events.push({ at: clock.now(), message, details: {
       phase, clicks: task.clicks, reloads: task.reloads, offsetMs: task.offsetMs,
@@ -414,9 +415,13 @@ export async function runTask(
           phase = 'натискання чекбокса перевірки';
           try {
             const clicked = await session.clickTurnstileCheckbox();
-            turnstileClickAttempted = true;
-            record(clicked ? 'Один раз натиснуто чекбокс перевірки. Очікуємо результат.'
-              : 'Видимий чекбокс не знайдено. Завершіть перевірку вручну.');
+            if (clicked) {
+              turnstileClickAttempted = true;
+              record('Один раз натиснуто чекбокс перевірки. Очікуємо результат.');
+            } else if (!turnstileWidgetPendingNoted) {
+              turnstileWidgetPendingNoted = true;
+              record('Чекбокс перевірки ще не завантажився або недоступний. Очікуємо його появи.');
+            }
           } catch (error) {
             if (signal.aborted) throw error;
             turnstileClickAttempted = true;

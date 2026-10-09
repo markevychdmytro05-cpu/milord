@@ -116,21 +116,36 @@ async function evaluateInWorld(cdp: CDPSession, expression: string) {
 // cloud_flare_js_url). The page never contacts this host before, so its connection is always cold.
 export const TURNSTILE_ORIGIN = 'https://challenges.cloudflare.com';
 
-// Click only the checkbox area of a visible, standard-size Turnstile widget. If its layout
-// differs, leave it to the person in the browser instead of guessing elsewhere on the page.
+// Click the actual checkbox inside a visible, standard-size Turnstile widget. The iframe can
+// scale with browser zoom, so a fixed offset from its edge can miss the checkbox itself.
 export async function clickVisibleTurnstileCheckbox(page: Page): Promise<boolean> {
   const frames = page.locator('iframe[src^="https://challenges.cloudflare.com/"]');
   const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
   for (let index = 0, count = await frames.count(); index < count; index++) {
     const frame = frames.nth(index);
     if (!await frame.isVisible()) continue;
-    await frame.scrollIntoViewIfNeeded();
-    const rect = await frame.boundingBox();
+    let rect;
+    try {
+      await frame.scrollIntoViewIfNeeded({ timeout: 1000 });
+      rect = await frame.boundingBox({ timeout: 1000 });
+    } catch { continue; } // The widget can replace its iframe while loading.
     if (!rect || rect.width < 250 || rect.width > 400 || rect.height < 50 || rect.height > 110 ||
         rect.x < 0 || rect.y < 0 || rect.x + rect.width > viewport.width ||
         rect.y + rect.height > viewport.height) continue;
-    // The standard Turnstile checkbox sits near the left edge of the widget iframe.
-    await page.mouse.click(rect.x + 28, rect.y + rect.height / 2);
+    const checkbox = frame.contentFrame().getByRole('checkbox');
+    let box;
+    try {
+      if (await checkbox.count() !== 1 || !await checkbox.isVisible() || await checkbox.isChecked({ timeout: 1000 })) continue;
+      box = await checkbox.boundingBox({ timeout: 1000 });
+    } catch { continue; } // Retry later if Turnstile refreshed between reads.
+    if (!box || box.width < 18 || box.height < 18 || box.height > 40 ||
+        box.x < rect.x || box.y < rect.y || box.x + box.width > rect.x + rect.width ||
+        box.y + box.height > rect.y + rect.height) continue;
+    // The input also covers its label. Aim at the centre of its square on the left.
+    const x = box.x + Math.min(12, box.height / 2);
+    const y = box.y + box.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.click(x, y, { delay: 120 });
     return true;
   }
   return false;

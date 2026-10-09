@@ -1,6 +1,6 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readNbuPage, assertShopPage, waitForActionablePage, clickBuyButton } from '../src/browser/nbu-page';
+import { readNbuPage, assertShopPage, waitForActionablePage, clickBuyButton, clickVisibleTurnstileCheckbox } from '../src/browser/nbu-page';
 import type { CDPSession, Page } from 'patchright-core';
 
 let dom: JSDOM | undefined;
@@ -101,6 +101,21 @@ it('detects a visible second widget even when the first placeholder is hidden', 
   document.querySelector('button')!.addEventListener('click', clicked);
   expect(() => readNbuPage(true)).toThrow('Page state changed');
   expect(clicked).not.toHaveBeenCalled();
+});
+
+it('aims inside the Turnstile checkbox at a scaled widget size', async () => {
+  const click = vi.fn();
+  const move = vi.fn();
+  const checkbox = { count: async () => 1, isVisible: async () => true, isChecked: async () => false,
+    boundingBox: async () => ({ x: 109, y: 220.5, width: 168, height: 24 }) };
+  const frame = { isVisible: async () => true, scrollIntoViewIfNeeded: async () => {},
+    boundingBox: async () => ({ x: 100, y: 200, width: 258, height: 56 }),
+    contentFrame: () => ({ getByRole: () => checkbox }) };
+  const browserPage = { evaluate: async () => ({ width: 1470, height: 797 }),
+    locator: () => ({ count: async () => 1, nth: () => frame }), mouse: { move, click } } as unknown as Page;
+  expect(await clickVisibleTurnstileCheckbox(browserPage)).toBe(true);
+  expect(move).toHaveBeenCalledWith(121, 232.5);
+  expect(click).toHaveBeenCalledWith(121, 232.5, { delay: 120 });
 });
 
 it('stops treating a widget as completed when the site removes its success state', () => {
