@@ -184,15 +184,15 @@ export function Cabinet({ profiles, now, active, connection, enabled = true }: {
       <label className="cabinet-auto" title="Автоматично оновлює лише кошик, поки відкритий кабінет"><input type="checkbox" checked={autoRefresh} disabled={!enabled} onChange={event => setAutoRefresh(event.target.checked)} />
         Автооновлення кошика · 15 хв
       </label>
-      <details className="cabinet-sync-details">
-        <summary>{visible.length ? `Оновлено: ${time(Math.min(...visible.map(snapshot => snapshot.fetchedAt)))}` : 'Про оновлення'}</summary>
-        <div className="cabinet-sync-info">
+      <div className="cabinet-sync-details" tabIndex={0}>
+        <span className="cabinet-sync-label">{visible.length ? `Оновлено: ${time(Math.min(...visible.map(snapshot => snapshot.fetchedAt)))}` : 'Про оновлення'}</span>
+        <div className="cabinet-sync-info" role="tooltip">
           {visible.map(snapshot => <p key={snapshot.profileId}>{profileName(snapshot.profileId)} · {time(snapshot.fetchedAt)}</p>)}
           <p>Ручне оновлення за потреби запускає AdsPower, профіль і вкладку НБУ. Автооновлення працює з відкритими профілями. Час за Києвом.</p>
           {autoRefresh && <p>Кошик оновлюється, поки відкритий кабінет. Після помилок пауза збільшується.
             {nextAutoAt && nextAutoAt > now ? ` Наступне оновлення: ${time(nextAutoAt)}.` : ''}</p>}
         </div>
-      </details>
+      </div>
     </div>
     {(!cacheReady || loading || !scope.length) && <div className="cabinet-notice" role="status">
       {!cacheReady ? (restoreError || 'Відновлюємо збережений кабінет…') : loading || 'Додайте профілі AdsPower у налаштуваннях.'}

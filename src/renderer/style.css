@@ -85,7 +85,7 @@ button.link.danger-text, .danger-text { color: var(--bad); }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 400px; grid-template-areas: "board composer"; gap: 24px; align-items: start; }
 .composer { grid-area: composer; }
 .board { grid-area: board; min-width: 0; }
-.settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; max-width: 1000px; align-items: start; }
+.settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; max-width: 1000px; align-items: stretch; }
 .settings-footer { grid-column: 1 / -1; }
 @media (max-width: 1080px) {
   .workspace { grid-template-columns: minmax(0, 1fr); grid-template-areas: "composer" "board"; }
@@ -95,7 +95,7 @@ button.link.danger-text, .danger-text { color: var(--bad); }
 /* panels */
 .composer, .settings > section { background: var(--panel); border: 1px solid var(--line); padding: 20px; }
 h2 { font-family: inherit; font-size: 15px; font-weight: 650; letter-spacing: 0; text-transform: none; }
-.composer > h2, .settings > section > h2, .saved-profiles > .row-between { margin: -20px -20px 20px; padding: 13px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.composer > h2, .settings > section > h2, .saved-profiles > .row-between { margin: -20px -20px 20px; padding: 0 20px; min-height: 52px; display: flex; align-items: center; background: var(--panel); border-bottom: 1px solid var(--line); }
 .saved-profiles > .row-between h2 { margin: 0; }
 .saved-profiles > .row-between button { padding: 7px 12px; }
 .board > h2 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
@@ -120,7 +120,7 @@ input[aria-invalid="true"] { border-color: var(--bad); }
 .check-select-all { padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
 input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; margin: 0; accent-color: var(--ink); flex: none; }
 .summary { font-size: 13px; color: var(--muted); margin: -4px 0 14px; }
-.advanced { margin-top: 4px; }
+.advanced { margin-top: 16px; }
 .advanced summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 12px; }
 .advanced .field { margin-top: 12px; }
 .profile-id { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 2px; }
@@ -284,11 +284,3 @@ button.behavior-expand { display: flex; align-items: center; gap: 8px; backgroun
 button.behavior-expand:hover:not(:disabled) { background: transparent; color: var(--blue); }
 .behavior-status { margin-top: 4px; }
 .behavior-test-details { margin-top: 12px; }
-.diagnostic-details { margin-top: 12px; font-size: 13px; }
-.diagnostic-details summary { cursor: pointer; }
-.diagnostic-details p { white-space: pre-line; margin-top: 8px; }
-.diagnostic-stats { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
-.diagnostic-stats h3 { font-size: 13px; margin-bottom: 6px; }
-
-.side .diagnostic-details p { overflow-wrap: anywhere; }
-.side .diagnostic-stats .hint { font-size: 12px; }

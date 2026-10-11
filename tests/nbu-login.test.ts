@@ -45,6 +45,16 @@ describe('NBU account store', () => {
     await reloaded.load();
     expect(reloaded.emails()).toEqual({ p2: 'two@example.com' });
   });
+  it('drops logins of profiles that are no longer saved', async () => {
+    const path = join(await mkdtemp(join(tmpdir(), 'nbu-accounts-')), 'accounts.enc');
+    const store = new AccountStore(path, cipher);
+    await store.save('p1', { email: 'one@example.com', password: 'secret-pass-1' });
+    await store.save('p2', { email: 'two@example.com', password: 'secret-pass-2' });
+    await store.prune(new Set(['p2']));
+    expect(store.emails()).toEqual({ p2: 'two@example.com' });
+    await store.prune(new Set());
+    expect(store.emails()).toEqual({});
+  });
   it('refuses to save without system encryption', async () => {
     const path = join(await mkdtemp(join(tmpdir(), 'nbu-accounts-')), 'accounts.enc');
     const store = new AccountStore(path, { ...cipher, available: () => false });

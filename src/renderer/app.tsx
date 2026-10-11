@@ -492,14 +492,6 @@ function App() {
   const shownSales = showAllHistory ? sales : sales.slice(0, HISTORY_PREVIEW);
   const open = attention.length + upcoming.length;
   const keyStatus = state?.savedApiKey ? 'Ключ збережено' : state?.hasApiKey ? 'Ключ із середовища' : 'Ключ не задано';
-  const today = tasks.filter((task) => dayKey(task.saleAt) === dayKey(now));
-  const todayStats = {
-    planned: today.length,
-    cart: today.filter((task) => task.status === 'in_cart').length,
-    errors: today.filter((task) => task.status === 'failed' || task.status === 'interrupted').length,
-  };
-  const settled = tasks.filter((task) => ['in_cart', 'failed', 'expired', 'interrupted'].includes(task.status));
-  const successRate = settled.length ? Math.round(tasks.filter((task) => task.status === 'in_cart').length / settled.length * 100) : null;
   const apiDot = profilesError ? 'bad' : state?.hasApiKey ? 'good' : 'idle';
   const apiText = profilesError ? 'Помилка' : state?.savedApiKey ? 'Ключ є' : state?.hasApiKey ? 'З середовища' : 'Немає ключа';
   // Different profiles ride different network paths and carry different typical offsets
@@ -551,9 +543,6 @@ function App() {
           <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val">{kyivClock}</span></div>
           <div className="sys-row" title={syncTitle}><Icon name="clock" /><span>Годинник ПК</span><span className="sys-val"><i className={`dot ${syncDot}`} />{syncText}</span></div>
           <div className="sys-row" title={offsetTitle}><Icon name="sync" /><span>Зсув сервера</span><span className="sys-val"><i className={`dot ${offsetDot}`} />{offsetText}</span></div>
-          <details className="diagnostic-details"><summary>Заміри за профілями</summary><p className="hint">{offsetTitle}</p></details>
-          <div className="diagnostic-stats"><h3>Сьогодні</h3><p className="hint">Завдань: {todayStats.planned} · у кошику: {todayStats.cart} · помилок: {todayStats.errors}</p>
-            <p className="hint">Успішних за весь час: {successRate === null ? '–' : `${successRate}%`}</p></div>
         </section>
     </aside>
     <main>

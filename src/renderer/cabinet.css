@@ -72,9 +72,10 @@
 .order-card .row-between { margin-bottom: 17px; }
 .cabinet-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
 .cabinet-auto { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 13px; color: var(--muted); }
-.cabinet-sync-details { margin-left: auto; max-width: 100%; }
-.cabinet-sync-details summary { cursor: pointer; }
-.cabinet-sync-info { max-width: 480px; padding-top: 8px; line-height: 1.5; }
+.cabinet-sync-details { position: relative; margin-left: auto; max-width: 100%; cursor: help; }
+.cabinet-sync-label { border-bottom: 1px dotted currentColor; }
+.cabinet-sync-info { display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 10; width: 360px; max-width: 80vw; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 4px 14px rgba(0, 0, 0, .12); color: var(--ink); line-height: 1.5; }
+.cabinet-sync-details:hover .cabinet-sync-info, .cabinet-sync-details:focus .cabinet-sync-info, .cabinet-sync-details:focus-within .cabinet-sync-info { display: block; }
 .cabinet-sync-info p + p { margin-top: 4px; }
 
 .cabinet-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0 14px; }

@@ -46,6 +46,12 @@ export class AccountStore {
     return this.write(rest);
   }
 
+  // Drops logins whose AdsPower profile is no longer saved, so their e-mails are free to reuse.
+  async prune(keep: ReadonlySet<string>): Promise<void> {
+    const rest = Object.fromEntries(Object.entries(this.accounts).filter(([id]) => keep.has(id)));
+    if (Object.keys(rest).length !== Object.keys(this.accounts).length) await this.write(rest);
+  }
+
   private write(next: Record<string, NbuCredentials>): Promise<void> {
     const operation = this.writes.then(async () => {
       if (!Object.keys(next).length) {

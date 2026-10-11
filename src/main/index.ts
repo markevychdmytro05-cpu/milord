@@ -214,6 +214,8 @@ async function boot(): Promise<void> {
       secretError = undefined;
     }
     await store.saveSettings(settingsSchema.parse(parsed));
+    await accountStore.prune(new Set(store.settings().savedProfiles.map(profile => profile.id)))
+      .catch(() => { accountsError = 'Не вдалося видалити збережені акаунти НБУ видалених профілів.'; });
     await license.check().catch(() => {});
   }));
   handle('clear-api-key', () => changeSettings(async () => {
