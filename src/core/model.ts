@@ -82,7 +82,26 @@ export const savedProfileSchema = z.object({
   name: z.string().trim().max(80).default(''),
 });
 export type SavedProfile = z.infer<typeof savedProfileSchema>;
+export const BROWSERS = ['adspower', 'dolphin', 'bitbrowser'] as const;
+export type BrowserKind = typeof BROWSERS[number];
+export const DEFAULT_API_URL: Record<BrowserKind, string> = {
+  adspower: 'http://127.0.0.1:50325',
+  dolphin: 'http://127.0.0.1:3001',
+  bitbrowser: 'http://127.0.0.1:54345',
+};
+export const BROWSER_NAMES: Record<BrowserKind, string> = { adspower: 'AdsPower', dolphin: 'Dolphin Anty', bitbrowser: 'BitBrowser' };
+// What a browser that is not selected keeps while it is inactive: its address and its own profiles.
+export const otherBrowserSchema = z.object({
+  apiUrl: z.string().transform(localApiUrl),
+  savedProfiles: z.array(savedProfileSchema).max(200).default([]),
+  defaultProfileIds: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)).max(50).default([]),
+});
+export type OtherBrowserSettings = z.infer<typeof otherBrowserSchema>;
 export const settingsSchema = z.object({
+  // Only read from files saved when two browsers were supported; the store moves it into `stash`.
+  other: otherBrowserSchema.optional(),
+  stash: z.partialRecord(z.enum(BROWSERS), otherBrowserSchema).default({}),
+  browser: z.enum(BROWSERS).default('adspower'),
   apiUrl: z.string().transform(localApiUrl),
   defaultProfileId: z.union([z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/), z.literal('')]).default(''),
   defaultProfileIds: z.array(z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/)).max(50).default([]),
@@ -95,7 +114,7 @@ export const settingsSchema = z.object({
   windowMin: z.number().int().min(1).max(30).default(5),
 });
 export type Settings = z.infer<typeof settingsSchema>;
-export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({ apiUrl: 'http://127.0.0.1:50325' });
+export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({ apiUrl: DEFAULT_API_URL.adspower });
 
 export interface AppState {
   license: LicenseState;
@@ -125,6 +144,7 @@ export interface DesktopApi {
   restoreCabinet(input: { connection: string; legacy?: string }): Promise<CabinetSavedState>;
   saveCabinet(input: { connection: string; state: CabinetSavedState }): Promise<void>;
   loadCabinetOrders(input: { profileId: string; page: number }): Promise<CabinetOrdersPage>;
+  openDolphinTokenPage(): Promise<void>;
   openCaptures(): Promise<void>;
   saveNbuAccount(input: { profileId: string; email: string; password: string }): Promise<void>;
   clearNbuAccount(profileId: string): Promise<void>;

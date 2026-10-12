@@ -41,7 +41,9 @@ export function readNbuPage(click = false): PageState {
     rateLimited: /(?:помилка\s*429|429\s*(?:помилка|error)|too many requests)/i.test(document.title) ||
       [...document.querySelectorAll('h1, h2')].some((heading) => /(?:\b429\b|too many requests)/i.test(heading.textContent || '')),
     login: loginLink ? 'logged-out' : !field ? 'unknown' : field.value ? 'logged-in' : 'logged-out',
-    challenge: !!document.querySelector('script[src*=".bunny-shield"]') ||
+    // Bunny Shield's script stays in the DOM of a page loaded while it verified the browser, even once the real
+    // shop is rendered. It only means a verification is in the way while the shop form is absent.
+    challenge: (!!document.querySelector('script[src*=".bunny-shield"]') && !form) ||
       document.title.startsWith('Establishing a secure connection'),
     turnstile,
     purchasePending,

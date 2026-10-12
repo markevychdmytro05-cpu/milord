@@ -9,6 +9,18 @@ import { task } from './helpers';
 async function storePath() { return join(await mkdtemp(join(tmpdir(), 'nbu-store-test-')), 'tasks.json'); }
 
 describe('persistent scheduler state', () => {
+  it('hands AdsPower-style profiles saved under Dolphin back to AdsPower', async () => {
+    const path = await storePath();
+    const store = new Store(path);
+    await store.saveSettings({ ...store.settings(), browser: 'dolphin', apiUrl: 'http://127.0.0.1:3001',
+      savedProfiles: [{ id: 'k1c0wob8', name: '7' }], defaultProfileIds: ['k1c0wob8'] });
+    const reopened = new Store(path);
+    await reopened.load();
+    expect(reopened.settings().savedProfiles).toEqual([]);
+    expect(reopened.settings().stash.adspower?.savedProfiles.map(p => p.id)).toEqual(['k1c0wob8']);
+    expect(reopened.settings().stash.adspower?.apiUrl).toBe('http://127.0.0.1:50325');
+  });
+
   it('keeps future schedules but marks previously running tasks interrupted', async () => {
     const path = await storePath();
     const store = new Store(path);

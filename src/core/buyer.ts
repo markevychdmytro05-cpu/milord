@@ -149,7 +149,7 @@ export async function runTask(
       return;
     }
     phase = 'підключення та підготовка профілю';
-    await update('preparing', 'Підключення до профілю AdsPower.');
+    await update('preparing', 'Підключення до профілю браузера.');
     session = await provider.connect(task.profileId, task.url, signal, {
       deadline: saleDeadline() - task.offsetMs,
       onRateLimit: () => update('preparing', 'НБУ відповів 429. Пауза перед автоматичним повтором; інші монети також очікують.'),
@@ -540,7 +540,7 @@ export async function runTask(
       ? error.message + (task.clicks || observedPurchase ? ' Перевірте кошик перед новою спробою.' : '')
       : task.clicks || observedPurchase
         ? 'Зв’язок або дія завершилися помилкою. Перевірте кошик перед новою спробою.'
-        : 'Не вдалося виконати завдання. Перевірте AdsPower, профіль і сторінку магазину.';
+        : 'Не вдалося виконати завдання. Перевірте браузер, профіль і сторінку магазину.';
     if (!signal.aborted && !(error instanceof UserFacingError) && !(error instanceof ShopRateLimitError)) {
       // The journal keeps only a classified note; the raw cause goes to the process log for diagnosis.
       console.error(`[task ${task.id}] ${phase}:`, error instanceof Error ? `${error.name}: ${error.message}` : error);

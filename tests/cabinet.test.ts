@@ -61,6 +61,11 @@ describe('cabinet DOM extraction', () => {
     expect(readCabinetPage({ section: 'orders', html: '<title>Establishing a secure connection</title>' }).error).toBe('challenge');
     expect(readCabinetPage({ section: 'cart', html: '<h1>429 Too Many Requests</h1>' }).error).toBe('rate-limit');
   });
+  it('does not treat the Bunny Shield script as a verification on a page with real shop content', () => {
+    const script = '<script src="/.bunny-shield/bd/bunnyprint.js"></script>';
+    expect(readCabinetPage({ section: 'wishlist', html: script + wishlist })).toEqual({ products: [] });
+    expect(readCabinetPage({ section: 'orders', html: script + '<p>Checking your browser</p>' }).error).toBe('challenge');
+  });
   it('reads wishlist product links while ignoring action links', () => {
     const html = `${login}<div class="content-wishList-wrap"><div><a href="coin/p-42.html">Монета</a><span class="new_price">50 грн</span>
       <a href="coin/p-42.html?action=add_product">Купити</a></div></div>`;

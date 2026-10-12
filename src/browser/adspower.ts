@@ -3,7 +3,7 @@ import { connectProfile } from './connect';
 import { z } from 'zod';
 import { localApiUrl, productUrl, type AdsProfile } from '../core/model';
 import { intersectBounds, responseOffsetBounds, type OffsetBounds } from '../core/clock-bounds';
-import type { BrowserProvider, PageState, PreparedProfile, PreparationOptions, ReloadTiming, ShopSession } from '../core/ports';
+import type { BrowserProvider, ProfileClient, PageState, PreparedProfile, PreparationOptions, ReloadTiming, ShopSession } from '../core/ports';
 import { realClock } from '../core/ports';
 import { glidePointer, pointerCurve, profileMotionTempo, wheelSteps } from '../core/pointer-motion';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
@@ -67,7 +67,7 @@ function profileNotFound(message: string | undefined): boolean {
 
 export class AdsPowerConnectionError extends UserFacingError {}
 
-export class AdsPowerClient {
+export class AdsPowerClient implements ProfileClient {
   private readonly base: string;
   constructor(apiUrl: string, private readonly apiKey: string, private readonly request: typeof fetch = fetch,
     private readonly startGate = new ProfileStartGate(), private readonly launch?: () => Promise<void>) {
@@ -267,7 +267,7 @@ export function reloadTiming(response: Pick<Response, 'status' | 'headers' | 're
 }
 
 export class AdsPowerProvider implements BrowserProvider {
-  constructor(private readonly client: AdsPowerClient,
+  constructor(private readonly client: ProfileClient,
     private readonly guard = new ShopRequestGuard(),
     private readonly preparationGate = new PreparationGate(),
     private readonly login?: NbuLogin,

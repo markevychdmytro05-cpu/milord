@@ -44,10 +44,14 @@ export function readCabinetPage(input: { section: CabinetSection | 'detail'; htm
   };
   const title = text(doc.querySelector('title'));
   if (/429|too many requests/i.test(title) || [...doc.querySelectorAll('h1,h2')].some(h => /\b429\b|too many requests/i.test(text(h)))) return { error: 'rate-limit' };
-  if (doc.querySelector('script[src*=".bunny-shield"], .cf-turnstile:not(.success)') || /Establishing a secure connection/i.test(title)) return { error: 'challenge' };
-  if (doc.querySelector('input[type="password"], form[name="login"]')) return { error: 'login' };
   const authenticated = links.some(a => pathOf(a)?.pathname === '/logoff.php');
   const root = doc.querySelector('.col-account-content');
+  // Bunny Shield's script is also in ordinary shop pages it has already verified. It only means a
+  // verification is in the way when no shop content came with it.
+  const bunnyOnly = !!doc.querySelector('script[src*=".bunny-shield"]') && !authenticated && !root &&
+    !doc.querySelector('input[type="password"], form[name="login"]');
+  if (bunnyOnly || doc.querySelector('.cf-turnstile:not(.success)') || /Establishing a secure connection/i.test(title)) return { error: 'challenge' };
+  if (doc.querySelector('input[type="password"], form[name="login"]')) return { error: 'login' };
   if (input.section !== 'cart' && !authenticated) return { error: 'login' };
   if (input.section === 'orders') {
     const table = doc.querySelector('#account_history_table');

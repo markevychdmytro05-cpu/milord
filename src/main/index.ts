@@ -21,6 +21,12 @@ import { AccountStore, nbuCredentialsSchema } from './account-store';
 import { NbuLogin } from '../browser/nbu-login';
 import { PageRecorder } from '../browser/page-recorder';
 import { launchAdsPower } from './adspower-launcher';
+import { launchDolphin } from './dolphin-launcher';
+import { DolphinClient } from '../browser/dolphin';
+import { BitBrowserClient } from '../browser/bitbrowser';
+import { launchBitBrowser } from './bitbrowser-launcher';
+import type { BrowserKind } from '../core/model';
+import type { ProfileClient } from '../core/ports';
 import { AtomicClock } from './ntp';
 import { hostname } from 'node:os';
 import { deviceId } from './device-id';
@@ -63,19 +69,31 @@ async function boot(): Promise<void> {
     encrypt: (value: string) => safeStorage.encryptString(value),
     decrypt: (value: Buffer) => safeStorage.decryptString(value),
   };
-  const keyStore = new KeyStore(join(app.getPath('userData'), 'adspower-key.enc'), cipher);
+  const keyStores: Record<BrowserKind, KeyStore> = {
+    adspower: new KeyStore(join(app.getPath('userData'), 'adspower-key.enc'), cipher),
+    dolphin: new KeyStore(join(app.getPath('userData'), 'dolphin-key.enc'), cipher),
+    bitbrowser: new KeyStore(join(app.getPath('userData'), 'bitbrowser-key.enc'), cipher), // optional
+  };
+  const envKeys: Record<BrowserKind, string> = {
+    adspower: process.env.ADSPOWER_API_KEY || '', dolphin: process.env.DOLPHIN_API_TOKEN || '', bitbrowser: '',
+  };
   const accountStore = new AccountStore(join(app.getPath('userData'), 'nbu-accounts.enc'), cipher);
   let accountsError = await accountStore.load();
-  const restoredKey = await keyStore.load();
-  let apiKey = restoredKey.value || process.env.ADSPOWER_API_KEY || '';
-  let savedApiKey = restoredKey.saved;
-  let secretError = restoredKey.error;
+  const restored = { adspower: await keyStores.adspower.load(), dolphin: await keyStores.dolphin.load(), bitbrowser: await keyStores.bitbrowser.load() };
+  const secrets: Record<BrowserKind, { key: string; saved: boolean }> = {
+    adspower: { key: restored.adspower.value || envKeys.adspower, saved: restored.adspower.saved },
+    dolphin: { key: restored.dolphin.value || envKeys.dolphin, saved: restored.dolphin.saved },
+    bitbrowser: { key: restored.bitbrowser.value, saved: restored.bitbrowser.saved },
+  };
+  let secretError = restored[store.settings().browser].error;
   let blocker: number | undefined;
   let scheduler: Scheduler;
   let licenseSuspended = false;
   let licenseGeneration = 0;
+  // Profiles of every browser: logins of inactive browsers are kept, and every saved profile counts for the license.
+  const allSavedIds = () => [...store.settings().savedProfiles, ...Object.values(store.settings().stash).flatMap(other => other?.savedProfiles ?? [])].map(profile => profile.id);
   const accountsUsed = (extra: string[] = []) => new Set([
-    ...store.settings().savedProfiles.map(profile => profile.id),
+    ...allSavedIds(),
     ...store.tasks().filter(task => !isFinal(task.status)).map(task => task.profileId), ...extra,
   ]).size;
   const license = new LicenseClient({
@@ -125,6 +143,13 @@ async function boot(): Promise<void> {
     }
   };
   const profileStartGate = new ProfileStartGate();
+  const currentKey = () => secrets[store.settings().browser].key;
+  const makeClient = (launch = true): ProfileClient => {
+    const { browser, apiUrl } = store.settings();
+    if (browser === 'dolphin') return new DolphinClient(apiUrl, currentKey(), fetch, profileStartGate, launch ? launchDolphin : undefined);
+    if (browser === 'bitbrowser') return new BitBrowserClient(apiUrl, currentKey(), fetch, profileStartGate, launch ? launchBitBrowser : undefined);
+    return new AdsPowerClient(apiUrl, currentKey(), fetch, profileStartGate, launch ? launchAdsPower : undefined);
+  };
   const shopGuard = new ShopRequestGuard();
   const preparationGate = new PreparationGate();
   const nbuLogin = new NbuLogin(profileId => accountStore.get(profileId), shopGuard, preparationGate);
@@ -134,7 +159,7 @@ async function boot(): Promise<void> {
   const atomicClock = new AtomicClock();
   atomicClock.start();
   scheduler = new Scheduler(store,
-    () => new AdsPowerProvider(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, recorder),
+    () => new AdsPowerProvider(makeClient(), shopGuard, preparationGate, nbuLogin, recorder),
     notify, busy,
     (message) => dialog.showErrorBox('Планувальник зупинено', message),
     () => atomicClock.current(),
@@ -149,8 +174,8 @@ async function boot(): Promise<void> {
     });
   }
 
-  handle('state', () => ({ tasks: store.tasks(), settings: store.settings(), license: licenseState(), hasApiKey: !!apiKey,
-    savedApiKey, secretStorageAvailable: keyStore.available(), secretError,
+  handle('state', () => ({ tasks: store.tasks(), settings: store.settings(), license: licenseState(), hasApiKey: store.settings().browser === 'bitbrowser' || !!currentKey(),
+    savedApiKey: secrets[store.settings().browser].saved, secretStorageAvailable: keyStores.adspower.available(), secretError,
     nbuAccounts: accountStore.emails(), accountsError,
     offsetHistoryByProfile: summarizeOffsetHistoryByProfile(store.tasks()), clockSync: atomicClock.last() }));
   handle('activate-license', input => {
@@ -198,9 +223,9 @@ async function boot(): Promise<void> {
   function changeSettings(action: () => Promise<void>, allowRunning = false): Promise<void> {
     const operation = settingsWrites.then(async () => {
       if (!allowRunning && scheduler.hasRunningWork()) throw new Error('Зупиніть активне виконання перед зміною підключення.');
-      const previousConnection = JSON.stringify([store.settings().apiUrl, apiKey]);
+      const previousConnection = JSON.stringify([store.settings().browser, store.settings().apiUrl, currentKey()]);
       await action();
-      if (JSON.stringify([store.settings().apiUrl, apiKey]) !== previousConnection) cabinetCache.clear();
+      if (JSON.stringify([store.settings().browser, store.settings().apiUrl, currentKey()]) !== previousConnection) cabinetCache.clear();
     });
     settingsWrites = operation.catch(() => {});
     return operation;
@@ -208,33 +233,32 @@ async function boot(): Promise<void> {
   handle('save-settings', (input) => changeSettings(async () => {
     const parsed = settingsSchema.extend({ apiKey: z.string().trim().min(1).max(4096).optional() }).parse(input);
     if (parsed.apiKey !== undefined) {
-      await keyStore.save(parsed.apiKey);
-      apiKey = parsed.apiKey;
-      savedApiKey = true;
+      await keyStores[parsed.browser].save(parsed.apiKey);
+      secrets[parsed.browser] = { key: parsed.apiKey, saved: true };
       secretError = undefined;
     }
     await store.saveSettings(settingsSchema.parse(parsed));
-    await accountStore.prune(new Set(store.settings().savedProfiles.map(profile => profile.id)))
+    await accountStore.prune(new Set(allSavedIds()))
       .catch(() => { accountsError = 'Не вдалося видалити збережені акаунти НБУ видалених профілів.'; });
     await license.check().catch(() => {});
   }));
   handle('clear-api-key', () => changeSettings(async () => {
-    await keyStore.clear();
-    apiKey = process.env.ADSPOWER_API_KEY || '';
-    savedApiKey = false;
+    const { browser } = store.settings();
+    await keyStores[browser].clear();
+    secrets[browser] = { key: envKeys[browser], saved: false };
     secretError = undefined;
   }));
   let profilesRequest: Promise<unknown> | undefined;
   let profilesConnection = '';
   handle('list-profiles', () => {
     if (scheduler.hasRunningWork()) throw new Error('Оновіть список після завершення активного виконання.');
-    const connection = JSON.stringify([store.settings().apiUrl, apiKey]);
+    const connection = JSON.stringify([store.settings().browser, store.settings().apiUrl, currentKey()]);
     if (profilesRequest && profilesConnection === connection) return profilesRequest;
     profilesConnection = connection;
-    const request = new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate)
+    const request = makeClient(false)
       .listProfiles(AbortSignal.timeout(180_000))
-      .catch((error) => { throw new Error(error instanceof Error && error.message.startsWith('AdsPower')
-        ? error.message : 'Не вдалося завантажити профілі. Перевірте AdsPower, Local API та ключ.'); })
+      .catch((error) => { throw new Error(error instanceof Error && /^(AdsPower|Dolphin|BitBrowser|Вкажіть|Перевірте)/.test(error.message)
+        ? error.message : 'Не вдалося завантажити профілі. Перевірте браузер, Local API та ключ.'); })
       .finally(() => { if (profilesRequest === request) profilesRequest = undefined; });
     profilesRequest = request;
     return request;
@@ -247,7 +271,7 @@ async function boot(): Promise<void> {
       showCursor: z.boolean().default(false), minutes: z.number().int().min(1).max(60) }).parse(input);
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
     return behaviorTests.run(profileId, cancel => scheduler.readProfile(profileId, signal => new BehaviorTester(
-      new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, undefined, undefined, nbuLogin,
+      makeClient(), shopGuard, preparationGate, undefined, undefined, nbuLogin,
     ).run(profileId, { navigate, showCursor, durationMs: minutes * 60_000 }, AbortSignal.any([signal, cancel])), minutes * 60_000 + 240_000));
   });
   handle('stop-behavior-test', input => { behaviorTests.stop(cabinetProfile.parse(input)); });
@@ -255,10 +279,12 @@ async function boot(): Promise<void> {
     requireLicense();
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
     return cabinetCache.get(JSON.stringify([profileId, key, openProfile]), () => scheduler.readProfile(profileId, signal => {
-      const reader = new CabinetReader(new AdsPowerClient(store.settings().apiUrl, apiKey, fetch, profileStartGate, launchAdsPower), shopGuard, preparationGate, nbuLogin, openProfile);
+      const reader = new CabinetReader(makeClient(), shopGuard, preparationGate, nbuLogin, openProfile);
       return read(reader, signal);
     }, openProfile ? 240_000 : 90_000)).catch(error => { throw new Error(cabinetError(error)); });
   }
+  // A fixed address, never one supplied by the window.
+  handle('open-dolphin-token-page', () => shell.openExternal('https://dolphin-anty.com/panel/#/api'));
   handle('open-captures', async () => {
     await mkdir(capturesPath, { recursive: true, mode: 0o700 });
     const error = await shell.openPath(capturesPath);
@@ -268,7 +294,9 @@ async function boot(): Promise<void> {
     const { profileId, ...credentials } = nbuCredentialsSchema.extend({ profileId: cabinetProfile }).parse(input);
     if (!store.settings().savedProfiles.some(profile => profile.id === profileId)) throw new Error('Збережіть профіль у налаштуваннях.');
     // NBU keeps one session per account: two profiles with the same login would sign each other out.
-    const taken = Object.entries(accountStore.emails()).find(([id, email]) => id !== profileId &&
+    // Only profiles of the selected browser count: the other browser's profiles are not used alongside these.
+    const sameBrowser = new Set(store.settings().savedProfiles.map(profile => profile.id));
+    const taken = Object.entries(accountStore.emails()).find(([id, email]) => id !== profileId && sameBrowser.has(id) &&
       email.toLowerCase() === credentials.email.toLowerCase());
     if (taken) {
       const name = store.settings().savedProfiles.find(profile => profile.id === taken[0])?.name || taken[0];

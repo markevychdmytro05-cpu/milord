@@ -284,3 +284,5 @@ button.behavior-expand { display: flex; align-items: center; gap: 8px; backgroun
 button.behavior-expand:hover:not(:disabled) { background: transparent; color: var(--blue); }
 .behavior-status { margin-top: 4px; }
 .behavior-test-details { margin-top: 12px; }
+#set-browser { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 0; background: var(--field); color: var(--ink); font-family: var(--mono); font-size: 13px; }
+#set-browser:focus { border-color: var(--ink); background: var(--panel); }

@@ -16,7 +16,9 @@ export function readLoginPage() {
     path: location.pathname,
     loggedIn: !!document.querySelector('a[href*="logoff.php"]'),
     form: !!form?.querySelector('input[name="email_address"]') && !!form.querySelector('input[name="password"]'),
-    challenge: !!document.querySelector('script[src*=".bunny-shield"], .cf-turnstile:not(.success), iframe[src*="turnstile"], .g-recaptcha, iframe[src*="recaptcha"], .h-captcha') ||
+    // The Bunny Shield script alone is not a verification once the login form is rendered (see readNbuPage).
+    challenge: (!!document.querySelector('script[src*=".bunny-shield"]') && !form) ||
+      !!document.querySelector('.cf-turnstile:not(.success), iframe[src*="turnstile"], .g-recaptcha, iframe[src*="recaptcha"], .h-captcha') ||
       document.title.startsWith('Establishing a secure connection'),
   };
 }

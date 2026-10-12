@@ -4,7 +4,8 @@ import { connectProfile } from './connect';
 import { glidePointer, pointerCurve, profileMotionTempo, readingPauseMs, wheelSteps, type BehaviorTestResult } from '../core/pointer-motion';
 import { realClock, type Clock } from '../core/ports';
 import { ShopRequestGuard, UserFacingError } from '../core/shop-errors';
-import { AdsPowerClient, PreparationGate } from './adspower';
+import type { ProfileClient } from '../core/ports';
+import { PreparationGate } from './adspower';
 import type { NbuLogin } from './nbu-login';
 
 const ORIGIN = 'https://coins.bank.gov.ua';
@@ -35,7 +36,9 @@ export function behaviorPageState() {
     login: document.querySelector('a[href*="logoff.php"]') || (document.querySelector<HTMLInputElement>('[name="cid_id"]')?.value)
       ? 'logged-in' as const
       : document.querySelector('a[href*="login.php"], #r_buy_intovar a.login') ? 'logged-out' as const : 'unknown' as const,
-    challenge: !!document.querySelector('script[src*=".bunny-shield"], .cf-turnstile:not(.success)') || /Establishing a secure connection/i.test(document.title) };
+    // Bunny Shield's script alone is not a verification once the shop itself is rendered (it has a login or logoff link).
+    challenge: (!!document.querySelector('script[src*=".bunny-shield"]') && !document.querySelector('a[href*="logoff.php"], a[href*="login.php"], [name="cid_id"]')) ||
+      !!document.querySelector('.cf-turnstile:not(.success)') || /Establishing a secure connection/i.test(document.title) };
 }
 // The link that a click at this point would follow, so the bot never clicks anything else.
 export function linkAt({ x, y }: { x: number; y: number }): string | undefined {
@@ -60,7 +63,7 @@ function installCursor({ id }: { id: string }) {
 export interface BehaviorOptions { navigate: boolean; showCursor?: boolean; durationMs?: number; }
 type Navigation = { status(): number; ok(): boolean; headers(): Record<string, string> } | null;
 export class BehaviorTester {
-  constructor(private readonly client: AdsPowerClient, private readonly guard: ShopRequestGuard,
+  constructor(private readonly client: ProfileClient, private readonly guard: ShopRequestGuard,
     private readonly gate: PreparationGate, private readonly clock: Clock = realClock, private readonly random = Math.random,
     private readonly login?: NbuLogin) {}
   async run(profileId: string, options: BehaviorOptions, signal: AbortSignal): Promise<BehaviorTestResult> {
@@ -99,7 +102,7 @@ export class BehaviorTester {
       browser = await connectProfile(endpoint, 15_000);
       signal.throwIfAborted();
       const context: BrowserContext | undefined = browser.contexts()[0];
-      if (!context) throw new UserFacingError('У профілі AdsPower немає відкритого вікна браузера.');
+      if (!context) throw new UserFacingError('У профілі браузера немає відкритого вікна браузера.');
       const pages = browser.contexts().flatMap(item => item.pages()).filter(candidate => {
         try { return !candidate.isClosed() && new URL(candidate.url()).origin === ORIGIN; } catch { return false; }
       });
@@ -217,7 +220,7 @@ export class BehaviorTester {
     } catch (error) {
       if (signal.aborted) result.stopped = true;
       else if (error === completed) { /* Requested duration has elapsed. */ }
-      else throw new Error(error instanceof UserFacingError ? error.message : 'Не вдалося виконати прогрів. Перевірте відкритий профіль AdsPower.');
+      else throw new Error(error instanceof UserFacingError ? error.message : 'Не вдалося виконати прогрів. Перевірте відкритий профіль браузера.');
     } finally {
       if (showCursor) await page?.evaluate(id => document.getElementById(id)?.remove(), markerId).catch(() => {});
       await browser?.close().catch(() => {});

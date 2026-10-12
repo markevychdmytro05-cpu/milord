@@ -17,6 +17,15 @@ function page(markup = '') {
 afterEach(() => { vi.unstubAllGlobals(); dom?.window.close(); });
 
 describe('NBU page recognition from the ported selectors', () => {
+  it('does not mistake the leftover Bunny Shield script on a rendered shop page for a verification', () => {
+    page('<script src="https://coins.bank.gov.ua/.bunny-shield/bd/bunnyprint.js"></script>');
+    expect(readNbuPage().challenge).toBe(false);
+  });
+  it('still treats the Bunny Shield script as a verification when the shop form is missing', () => {
+    dom = new JSDOM('<script src="/.bunny-shield/bd/bunnyprint.js"></script><p>Checking your browser</p>');
+    vi.stubGlobal('document', dom.window.document);
+    expect(readNbuPage().challenge).toBe(true);
+  });
   it('recognizes a logged-in customer and available button', () => {
     page();
     expect(readNbuPage()).toMatchObject({ login: 'logged-in', buyAvailable: true, inCart: false });

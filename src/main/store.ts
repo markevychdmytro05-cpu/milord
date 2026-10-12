@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { z } from 'zod';
-import { DEFAULT_SETTINGS, isFinal, settingsSchema, taskSchema, type Settings, type Task } from '../core/model';
+import { DEFAULT_API_URL, DEFAULT_SETTINGS, isFinal, settingsSchema, taskSchema, type Settings, type Task } from '../core/model';
 
 // Version 1 kept every task inside tasks.json; it is still read and migrated on load.
 const legacySchema = z.object({
@@ -64,6 +64,18 @@ export class Store {
         const { defaultProfileIds, defaultProfileId } = this.currentSettings;
         const ids = defaultProfileIds.length ? defaultProfileIds : defaultProfileId ? [defaultProfileId] : [];
         this.currentSettings.savedProfiles = [...new Set(ids)].map((id) => ({ id, name: '' }));
+      }
+      // Settings saved while Dolphin was selected, before browsers kept separate profiles, still hold the AdsPower
+      // list. Dolphin profile IDs are numbers, AdsPower's are not: give those profiles back to AdsPower.
+      const current = this.currentSettings;
+      // Files from the two-browser version kept the idle browser in `other`; it now lives in `stash`.
+      if (current.other) {
+        current.stash[current.browser === 'dolphin' ? 'adspower' : 'dolphin'] ??= current.other;
+        delete current.other;
+      }
+      if (current.browser === 'dolphin' && !current.stash.adspower && current.savedProfiles.some((profile) => !/^\d+$/.test(profile.id))) {
+        current.stash.adspower = { apiUrl: DEFAULT_API_URL.adspower, savedProfiles: current.savedProfiles, defaultProfileIds: current.defaultProfileIds };
+        current.savedProfiles = []; current.defaultProfileIds = []; current.defaultProfileId = '';
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT' && (error as NodeJS.ErrnoException).path === this.path) return;

@@ -39,7 +39,7 @@ export function LicensePanel({ license, refresh }: { license?: LicenseState; ref
     <details className="advanced"><summary>Дані підключення</summary>
       <p className="hint">Сервер: {license?.serverUrl ?? '…'}</p>
       <p className="hint">Пристрій: <code>{license?.deviceId ?? '…'}</code></p>
-      <p className="hint">Ключ зберігається зашифрованим на цьому комп’ютері. Профіль AdsPower рахується як один акаунт.</p>
+      <p className="hint">Ключ зберігається зашифрованим на цьому комп’ютері. Профіль антидетект-браузера рахується як один акаунт.</p>
     </details>
   </section>;
 }

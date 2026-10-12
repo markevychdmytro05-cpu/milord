@@ -61,6 +61,14 @@ export interface PreparationOptions {
   capture?: { taskId: string; saleAt: number };
 }
 
+// Local API of an antidetect browser (AdsPower, Dolphin Anty): opens a profile and returns its CDP endpoint.
+export interface ProfileClient {
+  listProfiles(signal: AbortSignal): Promise<import('./model').AdsProfile[]>;
+  // Query only: the CDP endpoint of an already open profile, or undefined when it is closed.
+  active(profileId: string, signal: AbortSignal): Promise<string | undefined>;
+  start(profileId: string, signal: AbortSignal, deadline?: number): Promise<string>;
+}
+
 export interface BrowserProvider {
   connect(profileId: string, url: string, signal: AbortSignal, options?: PreparationOptions): Promise<ShopSession>;
   prepare?(profileId: string, urls: string[], signal: AbortSignal, options?: PreparationOptions): Promise<PreparedProfile>;

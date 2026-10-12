@@ -188,14 +188,14 @@ export function Cabinet({ profiles, now, active, connection, enabled = true }: {
         <span className="cabinet-sync-label">{visible.length ? `Оновлено: ${time(Math.min(...visible.map(snapshot => snapshot.fetchedAt)))}` : 'Про оновлення'}</span>
         <div className="cabinet-sync-info" role="tooltip">
           {visible.map(snapshot => <p key={snapshot.profileId}>{profileName(snapshot.profileId)} · {time(snapshot.fetchedAt)}</p>)}
-          <p>Ручне оновлення за потреби запускає AdsPower, профіль і вкладку НБУ. Автооновлення працює з відкритими профілями. Час за Києвом.</p>
+          <p>Ручне оновлення за потреби запускає антидетект-браузер, профіль і вкладку НБУ. Автооновлення працює з відкритими профілями. Час за Києвом.</p>
           {autoRefresh && <p>Кошик оновлюється, поки відкритий кабінет. Після помилок пауза збільшується.
             {nextAutoAt && nextAutoAt > now ? ` Наступне оновлення: ${time(nextAutoAt)}.` : ''}</p>}
         </div>
       </div>
     </div>
     {(!cacheReady || loading || !scope.length) && <div className="cabinet-notice" role="status">
-      {!cacheReady ? (restoreError || 'Відновлюємо збережений кабінет…') : loading || 'Додайте профілі AdsPower у налаштуваннях.'}
+      {!cacheReady ? (restoreError || 'Відновлюємо збережений кабінет…') : loading || 'Додайте профілі в налаштуваннях.'}
     </div>}
     {restoreError && <button type="button" className="ghost" onClick={() => setRestoreAttempt(attempt => attempt + 1)}>Повторити читання збереженого кабінету</button>}
     {cacheError && <p className="field-error" role="alert">Не вдалося зберегти кабінет на диску. Після закриття програми ці дані можуть бути втрачені.</p>}
@@ -238,7 +238,7 @@ export function Cabinet({ profiles, now, active, connection, enabled = true }: {
           {currentPage(name) === pageCount(name) && visible.filter(snapshot => snapshot.nextOrdersPage).map(snapshot => <button key={snapshot.profileId} type="button" className="ghost cabinet-more"
             disabled={!enabled || !!loading} onClick={() => void loadMore(snapshot.profileId, snapshot.nextOrdersPage!)}>Ще замовлення · {profileName(snapshot.profileId)}</button>)}
           {!shownOrders.length && <CabinetEmpty title={loaded('orders') ? (query ? 'Замовлень не знайдено' : 'Замовлень немає') : 'Замовлення ще не завантажені'}
-            text={loaded('orders') ? (query ? 'Змініть пошуковий запит.' : 'У вибраних профілів немає замовлень.') : 'Натисніть «Оновити кабінет», щоб прочитати дані з профілів AdsPower.'} />}
+            text={loaded('orders') ? (query ? 'Змініть пошуковий запит.' : 'У вибраних профілів немає замовлень.') : 'Натисніть «Оновити кабінет», щоб прочитати дані з профілів браузера.'} />}
         </div>
         {selected && <aside id="order-details" className="order-details" aria-label={`Замовлення ${selected.id}`} onKeyDown={event => {
           if (event.key === 'Escape') { event.stopPropagation(); closeDetails(); }
@@ -264,7 +264,7 @@ export function Cabinet({ profiles, now, active, connection, enabled = true }: {
         {!products(name).length && <CabinetEmpty title={loaded(name)
           ? (query ? 'Монет не знайдено' : name === 'cart' ? 'Кошик порожній' : 'Бажане порожнє')
           : name === 'cart' ? 'Кошик ще не завантажений' : 'Бажане ще не завантажене'}
-          text={loaded(name) ? (query ? 'Змініть пошуковий запит.' : 'У вибраних профілях немає товарів у цьому розділі.') : 'Натисніть «Оновити кабінет», щоб прочитати дані з профілів AdsPower.'} />}
+          text={loaded(name) ? (query ? 'Змініть пошуковий запит.' : 'У вибраних профілях немає товарів у цьому розділі.') : 'Натисніть «Оновити кабінет», щоб прочитати дані з профілів браузера.'} />}
       </div>}
     </div>)}
   </section>;

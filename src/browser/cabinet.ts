@@ -3,14 +3,15 @@ import { type Browser, type Page } from 'patchright-core';
 import { connectProfile } from './connect';
 import type { CabinetOrderDetails, CabinetOrdersPage, CabinetSection, CabinetSnapshot } from '../core/cabinet';
 import { ShopRateLimitError, ShopRequestGuard, UserFacingError } from '../core/shop-errors';
-import { AdsPowerClient, AdsPowerConnectionError, PreparationGate } from './adspower';
+import type { ProfileClient } from '../core/ports';
+import { AdsPowerConnectionError, PreparationGate } from './adspower';
 import { readCabinetPage, type CabinetPageResult } from './cabinet-page';
 import type { NbuLogin } from './nbu-login';
 
 const ORIGIN = 'https://coins.bank.gov.ua';
 const messages = {
-  login: 'Увійдіть в акаунт НБУ у профілі AdsPower або додайте «Вхід НБУ» біля профілю в налаштуваннях.',
-  challenge: 'Завершіть перевірку НБУ у профілі AdsPower. Кабінет не змінює відкриті вкладки.',
+  login: 'Увійдіть в акаунт НБУ у профілі браузера або додайте «Вхід НБУ» біля профілю в налаштуваннях.',
+  challenge: 'Завершіть перевірку НБУ у профілі браузера. Кабінет не змінює відкриті вкладки.',
   'rate-limit': 'НБУ обмежив запити (429). Зачекайте та повторіть завантаження.',
   unrecognized: 'Не вдалося розпізнати дані сторінки НБУ. Список не вважається порожнім; повторіть завантаження.',
 };
@@ -18,13 +19,14 @@ export function cabinetError(error: unknown, signal?: AbortSignal): string {
   if (signal?.aborted) return 'Завантаження кабінету зупинено або вичерпано час очікування.';
   if (error instanceof ShopRateLimitError) return messages['rate-limit'];
   return error instanceof UserFacingError ? error.message
-    : 'Не вдалося прочитати кабінет. Перевірте AdsPower, вхід у НБУ та з’єднання.';
+    : 'Не вдалося прочитати кабінет. Перевірте браузер профілю, вхід у НБУ та з’єднання.';
 }
 
 class LoginRequiredError extends UserFacingError {}
+class ChallengeError extends UserFacingError {}
 
 export class CabinetReader {
-  constructor(private readonly client: AdsPowerClient, private readonly guard: ShopRequestGuard,
+  constructor(private readonly client: ProfileClient, private readonly guard: ShopRequestGuard,
     private readonly gate: PreparationGate, private readonly login?: NbuLogin, private readonly openProfile = false) {}
 
   // Each section is one request to the shop; background refreshes ask for the cart only.
@@ -101,7 +103,7 @@ export class CabinetReader {
       browser = await connectProfile(endpoint, 20_000);
       signal.throwIfAborted();
       const context = browser.contexts()[0];
-      if (!context) throw new UserFacingError('У профілі AdsPower немає відкритого вікна браузера.');
+      if (!context) throw new UserFacingError('У профілі браузера немає відкритого вікна браузера.');
       page = context.pages().find(candidate => {
         try { return !candidate.isClosed() && new URL(candidate.url()).origin === ORIGIN; } catch { return false; }
       });
@@ -117,7 +119,17 @@ export class CabinetReader {
             throw new UserFacingError(messages['rate-limit']);
           }
           assertOrigin();
-          if (response && !response.ok()) throw new UserFacingError(`НБУ відповів помилкою (HTTP ${response.status()}).`);
+          if (response && !response.ok()) {
+            // Bunny Shield answers the first load from a new profile or network with a 403 verification page that
+            // clears by itself. Give it time before calling the shop unavailable.
+            const cleared = response.status() === 403 && await page!.waitForFunction(
+              () => !document.title.startsWith('Establishing a secure connection') &&
+                !!document.querySelector('a[href*="login.php"], a[href*="logoff.php"]'),
+              undefined, { timeout: 20_000 }).then(() => true, () => false);
+            signal.throwIfAborted();
+            if (!cleared) throw new UserFacingError(`НБУ відповів помилкою (HTTP ${response.status()}).`);
+            assertOrigin();
+          }
         }));
       }
       if (!page) throw new UserFacingError('Відкрийте вкладку НБУ або натисніть «Оновити кабінет».');
@@ -134,12 +146,35 @@ export class CabinetReader {
           const parsed = await page!.evaluate(readCabinetPage, { section, page: pageNumber, orderId, html: response.html });
           if (parsed.error) {
             if (parsed.error === 'rate-limit' && !this.guard.isBlocked()) this.guard.block();
-            throw new (parsed.error === 'login' ? LoginRequiredError : UserFacingError)(messages[parsed.error]);
+            throw new (parsed.error === 'login' ? LoginRequiredError : parsed.error === 'challenge' ? ChallengeError : UserFacingError)(messages[parsed.error]);
           }
           if (response.status < 200 || response.status >= 300) throw new UserFacingError(`НБУ відповів помилкою (HTTP ${response.status}).`);
           return parsed;
         }));
-      const first = () => fetchPage(request.section, request.page, request.orderId, request.detailId);
+      // Bunny Shield's verification lasts about ten minutes and a background fetch cannot renew it: it answers
+      // 403 "Establishing a secure connection". A real page load renews it, so load the shop once in a separate
+      // tab (cookies are shared by the profile) and read again. Open tabs are never navigated.
+      let reverified = false;
+      const reverify = () => this.gate.run(signal, () => this.readOnce(signal, async () => {
+        checkGuard();
+        const verifier = await page!.context().newPage();
+        try {
+          await verifier.goto(`${ORIGIN}/`, { waitUntil: 'domcontentloaded', timeout: 25_000 });
+          signal.throwIfAborted();
+          await verifier.waitForFunction(() => !document.title.startsWith('Establishing a secure connection') &&
+            !!document.querySelector('a[href*="login.php"], a[href*="logoff.php"]'), undefined, { timeout: 20_000 });
+        } finally { await verifier.close().catch(() => {}); }
+      }));
+      const fetchRenewing: typeof fetchPage = async (...args) => {
+        try { return await fetchPage(...args); }
+        catch (error) {
+          if (!(error instanceof ChallengeError) || !this.openProfile || reverified) throw error;
+          reverified = true;
+          try { await reverify(); } catch (failure) { if (signal.aborted) throw failure; throw error; }
+          return fetchPage(...args);
+        }
+      };
+      const first = () => fetchRenewing(request.section, request.page, request.orderId, request.detailId);
       let initial: CabinetPageResult;
       try { initial = await first(); }
       catch (error) {
@@ -148,7 +183,7 @@ export class CabinetReader {
         await this.login.ensure(page.context(), profileId, signal);
         initial = await first();
       }
-      return await action(page, initial, fetchPage);
+      return await action(page, initial, fetchRenewing);
     } catch (error) { throw new UserFacingError(cabinetError(error, signal)); }
     finally {
       signal.removeEventListener('abort', abort);

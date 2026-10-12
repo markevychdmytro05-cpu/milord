@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type DesktopApi, type SavedProfile, type Task, type TaskStatus } from '../core/model';
+import { BROWSERS, BROWSER_NAMES, DEFAULT_API_URL, isFinal, localApiUrl, productUrl, type AdsProfile, type AppState, type BrowserKind, type OtherBrowserSettings, type DesktopApi, type SavedProfile, type Task, type TaskStatus } from '../core/model';
 import { kyivDateTimeInput, nextKyivSale, parseKyivDateTime, SALE_TIME_ZONE } from '../core/kyiv-time';
 import { isFreshClockSync } from '../core/clock-sync';
 import '@fontsource-variable/inter/index.css';
@@ -292,6 +292,9 @@ function App() {
   const [profilesNote, setProfilesNote] = useState('');
   // Settings form
   const [apiUrl, setApiUrl] = useState('');
+  const [browser, setBrowser] = useState<BrowserKind>('adspower');
+  // Browsers that are not selected keep their own address and profiles until the form is saved.
+  const [stash, setStash] = useState<Partial<Record<BrowserKind, OtherBrowserSettings>>>({});
   const [nums, setNums] = useState({ leadMin: '', retrySec: '', windowMin: '' });
   const [apiKey, setApiKey] = useState('');
   const [urlOpen, setUrlOpen] = useState(false);
@@ -307,7 +310,8 @@ function App() {
     void window.desktop.state().then((next) => {
       if (!alive) return;
       setState(next);
-      setApiUrl(next.settings.apiUrl);
+      setApiUrl(next.settings.apiUrl); setBrowser(next.settings.browser);
+      setStash(next.settings.stash);
       setNums({ leadMin: String(next.settings.leadMin), retrySec: String(next.settings.retrySec), windowMin: String(next.settings.windowMin) });
       setProfileDrafts(next.settings.savedProfiles);
       const previous = next.settings.defaultProfileIds.length ? next.settings.defaultProfileIds
@@ -370,7 +374,7 @@ function App() {
       } catch (error) { found.saleAt = human(error, 'Вкажіть дату й час початку.'); }
     }
     const bad = profiles.find((id) => !PROFILE_ID.test(id));
-    if (!profiles.length) found.profiles = 'Оберіть хоча б один профіль AdsPower.';
+    if (!profiles.length) found.profiles = 'Оберіть хоча б один профіль.';
     else if (profiles.length > 50) found.profiles = 'Для одного запуску оберіть не більше 50 профілів.';
     else if (bad) found.profiles = `ID «${bad}» не підходить: лише латиниця, цифри, «-» та «_».`;
     setErrors(found);
@@ -389,7 +393,7 @@ function App() {
         url: coinUrl.trim(), profileId, saleAt: saleAtMs, leadMin, retrySec, windowMin, mode: 'cart' as const,
       }))));
       setTaskView('active');
-      setNotice({ kind: 'ok', text: `Заплановано: ${profiles.length * coinUrls.length} ${plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}. Залиште Numis і AdsPower відкритими.` });
+      setNotice({ kind: 'ok', text: `Заплановано: ${profiles.length * coinUrls.length} ${plural(profiles.length * coinUrls.length, 'завдання', 'завдання', 'завдань')}. Залиште Numis і антидетект-браузер відкритими.` });
       setUrl(''); setExtraUrls([]); setErrors({});
       // Remember the last used profiles; this is best-effort and must never fail the scheduling.
       if (profiles.length <= 50 && profiles.join() !== defaultProfileIds.join()) {
@@ -411,13 +415,28 @@ function App() {
       setNotice({ kind: 'info', text: lines.join('\n') });
     });
   }
+  // Parked browsers are saved as they are, minus empty or repeated rows and an unusable address.
+  function parkedSettings(): Partial<Record<BrowserKind, OtherBrowserSettings>> {
+    const result: Partial<Record<BrowserKind, OtherBrowserSettings>> = {};
+    for (const kind of BROWSERS) {
+      const other = stash[kind];
+      if (!other || kind === browser) continue;
+      const seen = new Set<string>();
+      const savedProfiles = other.savedProfiles.map((p) => ({ id: p.id.trim(), name: p.name.trim().slice(0, 80) }))
+        .filter((p) => PROFILE_ID.test(p.id) && !seen.has(p.id) && !!seen.add(p.id)).slice(0, 200);
+      let url = DEFAULT_API_URL[kind];
+      try { url = localApiUrl(other.apiUrl.trim()); } catch { /* keep the default */ }
+      result[kind] = { apiUrl: url, savedProfiles, defaultProfileIds: other.defaultProfileIds.filter((id) => seen.has(id)).slice(0, 50) };
+    }
+    return result;
+  }
   function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!state) return;
     const found: Record<string, string> = {};
     try { localApiUrl(apiUrl.trim()); }
     catch (error) {
-      found.apiUrl = error instanceof TypeError || !(error instanceof Error) ? 'Вкажіть адресу, наприклад http://127.0.0.1:50325.' : error.message;
+      found.apiUrl = error instanceof TypeError || !(error instanceof Error) ? `Вкажіть адресу, наприклад ${DEFAULT_API_URL[browser]}.` : error.message;
     }
     const ranges = { leadMin: [1, 60], retrySec: [1, 60], windowMin: [1, 30] } as const;
     for (const key of Object.keys(ranges) as (keyof typeof ranges)[]) {
@@ -435,7 +454,7 @@ function App() {
     if (first) { setTimeout(() => document.getElementById(`set-${first}`)?.focus(), 0); return; }
     void perform(async () => {
       await window.desktop.saveSettings({
-        apiUrl: apiUrl.trim(), savedProfiles, defaultProfileId: '',
+        browser, apiUrl: apiUrl.trim(), savedProfiles, defaultProfileId: '', stash: parkedSettings(),
         defaultProfileIds: selected.filter((id) => savedProfiles.some((profile) => profile.id === id)),
         leadMin: Number(nums.leadMin), retrySec: Number(nums.retrySec), windowMin: Number(nums.windowMin),
         ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
@@ -491,6 +510,19 @@ function App() {
   const sales = [...historyBySale.entries()].sort(([a], [b]) => b - a);
   const shownSales = showAllHistory ? sales : sales.slice(0, HISTORY_PREVIEW);
   const open = attention.length + upcoming.length;
+  const savedBrowser = state?.settings.browser ?? 'adspower';
+  const brand = BROWSER_NAMES[browser];
+  const keyName = browser === 'dolphin' ? 'API-токен' : 'API-ключ';
+  const sameBrowser = browser === savedBrowser; // key status describes the saved browser only
+  function chooseBrowser(next: BrowserKind) {
+    if (next === browser) return;
+    // Each browser keeps its own address, profiles and selection: park this form, load the chosen one.
+    const target = stash[next] ?? { apiUrl: DEFAULT_API_URL[next], savedProfiles: [], defaultProfileIds: [] };
+    setStash({ ...stash, [browser]: { apiUrl: apiUrl.trim(), savedProfiles: profileDrafts, defaultProfileIds: selected } });
+    setApiUrl(target.apiUrl); setProfileDrafts(target.savedProfiles); setSelected(target.defaultProfileIds);
+    setSettingsErrors({}); setApiKey('');
+    setBrowser(next); setAvailable([]); setProfilesError(''); setProfilesNote('');
+  }
   const keyStatus = state?.savedApiKey ? 'Ключ збережено' : state?.hasApiKey ? 'Ключ із середовища' : 'Ключ не задано';
   const apiDot = profilesError ? 'bad' : state?.hasApiKey ? 'good' : 'idle';
   const apiText = profilesError ? 'Помилка' : state?.savedApiKey ? 'Ключ є' : state?.hasApiKey ? 'З середовища' : 'Немає ключа';
@@ -538,7 +570,7 @@ function App() {
         </button>)}
       </div></nav>
         <section className="side-block diagnostics" aria-labelledby="diagnostics-title"><h2 id="diagnostics-title">Діагностика</h2>
-          <div className="sys-row"><Icon name="link" /><span>AdsPower API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
+          <div className="sys-row"><Icon name="link" /><span>{BROWSER_NAMES[savedBrowser]} API</span><span className="sys-val"><i className={`dot ${apiDot}`} />{apiText}</span></div>
           <div className="sys-row"><Icon name="users" /><span>Профілі</span><span className="sys-val">{options.length}</span></div>
           <div className="sys-row"><Icon name="clock" /><span>Київ</span><span className="sys-val">{kyivClock}</span></div>
           <div className="sys-row" title={syncTitle}><Icon name="clock" /><span>Годинник ПК</span><span className="sys-val"><i className={`dot ${syncDot}`} />{syncText}</span></div>
@@ -595,7 +627,7 @@ function App() {
                 </label>
                 {options.length > 6 && <input aria-label="Пошук профілів" placeholder="Пошук за назвою або ID" value={profileSearch}
                   onChange={(e) => setProfileSearch(e.target.value)} />}
-                <div className="checklist" role="group" aria-label="Профілі AdsPower">
+                <div className="checklist" role="group" aria-label="Профілі">
                   {shownProfiles.map((profile) => <label className="check" key={profile.id}>
                     <input type="checkbox" checked={selected.includes(profile.id)} onChange={(e) => setSelected((current) =>
                       e.target.checked ? [...current, profile.id] : current.filter((id) => id !== profile.id))} />
@@ -681,7 +713,7 @@ function App() {
                   onChange={(e) => setProfileDrafts((current) => current.map((row, i) => i === index ? { ...row, name: e.target.value } : row))} />
               </Field>
               <Field id={`profile-id-${index}`} label="ID профілю">
-                <input id={`profile-id-${index}`} placeholder="ID з таблиці профілів AdsPower" value={profile.id} autoComplete="off" maxLength={80}
+                <input id={`profile-id-${index}`} placeholder="ID з таблиці профілів" value={profile.id} autoComplete="off" maxLength={80}
                   onChange={(e) => setProfileDrafts((current) => current.map((row, i) => i === index ? { ...row, id: e.target.value } : row))} />
               </Field>
               <button type="button" className="profile-remove" title="Видалити профіль" aria-label={`Видалити профіль ${profile.name || profile.id || index + 1}`}
@@ -691,10 +723,10 @@ function App() {
               {saved && accountOpen === id && <NbuAccountEditor profileId={id} email={state?.nbuAccounts[id]}
                 onClose={() => { setAccountOpen(''); void window.desktop.state().then(setState).catch(() => {}); }} />}
             </div>; })}
-            {!profileDrafts.length && <p className="hint">Додайте ID з AdsPower. Назву можна задати для зручності. API-ключ для цього не потрібен.</p>}
+            {!profileDrafts.length && <p className="hint">Додайте ID з таблиці профілів браузера. Назву можна задати для зручності. API-ключ для цього не потрібен.</p>}
           </div>
           {settingsErrors.profiles && <p className="field-error" role="alert">{settingsErrors.profiles}</p>}
-          <details className="profile-import"><summary>Імпорт через API AdsPower</summary>
+          <details className="profile-import"><summary>Імпорт через API {brand}</summary>
             <button type="button" className="link" disabled={profilesLoading || busy} onClick={() => void refreshProfiles()}>
               {profilesLoading ? 'Завантаження…' : 'Завантажити профілі'}</button>
             {profilesError && <p className="hint warn">{profilesError} Можна додати профілі вручну вище.</p>}
@@ -707,23 +739,32 @@ function App() {
             </div>)}
           </details>
         </section>
-        <section aria-labelledby="conn-title"><h2 id="conn-title">Підключення до AdsPower</h2>
+        <section aria-labelledby="conn-title"><h2 id="conn-title">Підключення до {brand}</h2>
           <div className="field">
-            <div className="row-between"><label htmlFor="set-apiKey">API-ключ</label>
-              <span className={`pill ${state?.hasApiKey ? 'good' : 'attention'}`}>{keyStatus}</span></div>
+            <label htmlFor="set-browser">Антидетект-браузер</label>
+            <select id="set-browser" value={browser} disabled={busy} onChange={(e) => chooseBrowser(e.target.value as BrowserKind)}>
+              {BROWSERS.map((kind) => <option key={kind} value={kind}>{BROWSER_NAMES[kind]}</option>)}
+            </select>
+            {!sameBrowser && <p className="hint warn">Браузер зміниться після збереження. Адреса й профілі в кожного браузера свої, нічого не губиться.</p>}
+          </div>
+          <div className="field">
+            <div className="row-between"><label htmlFor="set-apiKey">{keyName}{browser === 'bitbrowser' ? ' (необов’язково)' : ''}</label>
+              {sameBrowser && (browser !== 'bitbrowser' || state?.savedApiKey) && <span className={`pill ${state?.hasApiKey ? 'good' : 'attention'}`}>{keyStatus}</span>}</div>
             <input id="set-apiKey" type="password" autoComplete="off" value={apiKey}
-              placeholder={state?.hasApiKey ? 'Вставте новий ключ, щоб замінити' : 'Вставте ключ з налаштувань AdsPower'}
+              placeholder={sameBrowser && state?.hasApiKey ? 'Вставте новий, щоб замінити' : browser === 'dolphin' ? 'Вставте токен з кабінету Dolphin Anty' : browser === 'bitbrowser' ? 'X-API-KEY з налаштувань BitBrowser' : 'Вставте ключ з налаштувань AdsPower'}
               onChange={(e) => setApiKey(e.target.value)} />
-            <p className="hint">Ключ береться в AdsPower: розділ Local API. Зберігається на цьому комп’ютері в зашифрованому вигляді.</p>
+            {browser === 'bitbrowser' && <p className="hint">Потрібен лише якщо в BitBrowser (Settings → Local API) увімкнено Authentication Control. Інакше залиште порожнім. Запустіть BitBrowser і увійдіть в акаунт.</p>}
+            {browser === 'adspower' && <p className="hint">Ключ береться в AdsPower: розділ Local API. Зберігається на цьому комп’ютері в зашифрованому вигляді.</p>}
+            {browser === 'dolphin' && <button type="button" className="link" onClick={() => void window.desktop.openDolphinTokenPage().catch(() => {})}>Відкрити сторінку створення токена ↗</button>}
             {state && !state.secretStorageAvailable && <p className="hint warn">Системне сховище ключів недоступне, тому новий ключ зберегти не вдасться.</p>}
-            {state?.savedApiKey && <button type="button" className="link danger-text" disabled={busy} onClick={() => void perform(async () => {
+            {sameBrowser && state?.savedApiKey && <button type="button" className="link danger-text" disabled={busy} onClick={() => void perform(async () => {
               await window.desktop.clearApiKey(); setApiKey(''); setNotice({ kind: 'ok', text: 'Збережений ключ видалено.' });
             })}>Видалити збережений ключ</button>}
           </div>
           <details className="advanced" open={urlOpen} onToggle={(e) => setUrlOpen(e.currentTarget.open)}>
             <summary>Адреса Local API: <code>{state?.settings.apiUrl ?? '…'}</code></summary>
             <Field id="set-apiUrl" label="Адреса Local API" error={settingsErrors.apiUrl}
-              hint="Змінюйте, лише якщо AdsPower працює на іншому порту. Підходить 127.0.0.1 або localhost.">
+              hint={`Змінюйте, лише якщо ${brand} працює на іншому порту. Підходить 127.0.0.1 або localhost.`}>
               <input id="set-apiUrl" type="url" value={apiUrl} aria-invalid={!!settingsErrors.apiUrl}
                 onChange={(e) => setApiUrl(e.target.value)} />
             </Field>

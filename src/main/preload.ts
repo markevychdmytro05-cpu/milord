@@ -11,6 +11,7 @@ const api: DesktopApi = {
   restoreCabinet: (input) => ipcRenderer.invoke('restore-cabinet', input),
   saveCabinet: (input) => ipcRenderer.invoke('save-cabinet', input),
   loadCabinetOrders: (input) => ipcRenderer.invoke('load-cabinet-orders', input),
+  openDolphinTokenPage: () => ipcRenderer.invoke('open-dolphin-token-page'),
   openCaptures: () => ipcRenderer.invoke('open-captures'),
   saveNbuAccount: (input) => ipcRenderer.invoke('save-nbu-account', input),
   clearNbuAccount: (profileId) => ipcRenderer.invoke('clear-nbu-account', profileId),
