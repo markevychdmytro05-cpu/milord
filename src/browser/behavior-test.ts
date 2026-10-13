@@ -119,6 +119,18 @@ export class BehaviorTester {
       deadline = durationMs === undefined ? Infinity : started + durationMs;
       let url = page.url();
       let state = await page.evaluate(behaviorPageState);
+      // Bunny Shield's "Establishing a secure connection" page usually clears by itself and, when it hangs,
+      // a reload clears it, like a manual hard reload. Only a check that survives that needs a person.
+      for (let attempt = 0; state.challenge && attempt < 3; attempt++) {
+        await this.clock.sleep(attempt === 0 ? 6000 : 3000, signal);
+        state = await page.evaluate(behaviorPageState).catch(() => state);
+        if (!state.challenge) break;
+        await load(() => page!.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 })).catch((error) => {
+          if (signal.aborted || error instanceof UserFacingError) throw error;
+        });
+        url = page.url();
+        state = await page.evaluate(behaviorPageState);
+      }
       if (state.challenge) throw new UserFacingError('Завершіть перевірку сайту вручну перед прогрівом.');
       result.login = state.login;
       if (state.login === 'logged-out') {

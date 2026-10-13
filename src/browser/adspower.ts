@@ -367,11 +367,11 @@ export class AdsPowerProvider implements BrowserProvider {
       try { browser = await connectProfile(endpoint, 20_000); }
       catch (error) {
         if (signal.aborted) throw error;
-        throw new UserFacingError('Не вдалося підключитися до браузера профілю. Закрийте профіль в AdsPower і спробуйте знову.');
+        throw new UserFacingError('Не вдалося підключитися до браузера профілю. Закрийте профіль у браузері (AdsPower, BitBrowser або Dolphin) і спробуйте знову.');
       }
       signal.throwIfAborted();
       const context = browser.contexts()[0];
-      if (!context) throw new UserFacingError('У профілі AdsPower немає відкритого вікна браузера.');
+      if (!context) throw new UserFacingError('У профілі немає відкритого вікна браузера.');
       const shopPages = context.pages().filter((page) => {
         try { return new URL(page.url()).origin === 'https://coins.bank.gov.ua'; } catch { return false; }
       });
@@ -418,7 +418,23 @@ export class AdsPowerProvider implements BrowserProvider {
           if (this.guard.isBlocked()) await options?.onRateLimit?.();
           await this.guard.retry(signal, deadline, () => this.preparationGate.run(signal, async () => {
             await this.guard.wait(signal, deadline);
-            const response = await goto(page, target);
+            // A page stuck on "Establishing a secure connection" is what a manual hard reload fixes:
+            // stop it and load again instead of failing the whole preparation.
+            let response: Response | null = null;
+            for (let attempt = 0; ; attempt++) {
+              navigationSentAt.set(page, Date.now());
+              try {
+                response = attempt === 0 ? await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 10_000 })
+                  : await page.reload({ waitUntil: 'domcontentloaded', timeout: 10_000 });
+                break;
+              } catch (error) {
+                signal.throwIfAborted();
+                if (attempt >= 3 || Date.now() >= deadline || !(error instanceof Error) || !/Timeout|ERR_/i.test(error.message)) throw error;
+                await page.context().newCDPSession(page).then((cdp) => cdp.send('Page.stopLoading').finally(() => cdp.detach()))
+                  .catch(() => {});
+                await realClock.sleep(500, signal);
+              }
+            }
             if (response) observeResponse(page, response);
             const state = await page.evaluate(readNbuPage, false);
             if (state.rateLimited) this.guard.block();
